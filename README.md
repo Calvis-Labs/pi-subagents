@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). In pi's fullscreen mode it is a borderless, full-terminal observer with mouse support. Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Press `b` on a running foreground `Agent` call to hand that run to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)). Stop a still-running agent by pressing `x` (then `x` again to confirm) — steer and stop both work for background agents too. Assistant text renders as Markdown; `m` cycles that between off, assistant-only and everything (see [Viewer markdown](#persistent-settings))
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
-- **Package-shipped agents** — a pi package can declare its own subagents (and workflow scripts) with `"pi": { "subagents": { "agents": ["./agents"] } }` in its `package.json`, so `pi install` is the whole setup: no copying files into `.pi/agents/` on every machine or container start. Only packages pi has actually installed are read (never `node_modules`), package definitions rank below every agent you wrote, and `/agents` shows them read-only with Eject and Disable. Narrow or switch it off with `packageAgents` / `packageWorkflows`
+- **Package-shipped agents** — a pi package can declare its own subagents (and workflow scripts) with `"pi": { "subagents": { "agents": ["./agents"] } }` in its `package.json`, so `pi install` is the whole setup: no copying files into `.pi/agents/` on every machine or container start. Only packages pi has actually installed are read (never `node_modules`), package definitions rank below every agent you wrote, and `/agents` shows them read-only with Eject and Disable. Narrow or switch it off with `packageAgents` / `packageWorkflows`. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/packages.md)**
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
 - **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
@@ -438,16 +438,13 @@ The last two rows are separate because zero built-ins is not zero tools: `tools:
 
 ### Shipping agents in a pi package
 
-A pi package can ship subagents the same way it ships skills, so a reusable agent travels with the package that needs it instead of being copied into every project's `.pi/agents/` ([#109](https://github.com/tintinweb/pi-subagents/issues/109)).
-
-Declare the paths in the package's `package.json`:
+A pi package can ship subagents the same way it ships skills, so a reusable agent travels with the package that needs it instead of being copied into every project's `.pi/agents/` ([#109](https://github.com/tintinweb/pi-subagents/issues/109)). Declare the paths in the package's `package.json`:
 
 ```json
 {
   "name": "my-subagents",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./src/index.ts"],
     "subagents": {
       "agents": ["./agents"],
       "workflows": ["./workflows"]
@@ -456,43 +453,22 @@ Declare the paths in the package's `package.json`:
 }
 ```
 
-Entries are paths relative to the package root. A directory is scanned for `.md` agent files (`.js` for [workflows](docs/workflows.md)); a path naming a single file is taken as that file; an entry prefixed with `!` excludes one. Nothing outside the package root is ever read.
-
-Four spellings are accepted, all meaning the same thing — the top-level `pi-subagents` key is the one [`nicobailon/pi-subagents`](https://github.com/nicobailon/pi-subagents) reads, so one manifest works with either extension:
-
-```jsonc
-"pi": { "subagents": { "agents": ["./agents"], "workflows": ["./flows"] } }
-"pi": { "subagents": ["./agents"] }            // shorthand for { "agents": [...] }
-"pi-subagents": { "agents": ["./agents"] }
-"pi-subagents": ["./agents"]                   // shorthand for { "agents": [...] }
-```
-
 Users get the agents by installing the package with pi — no copy step:
 
 ```bash
 pi install npm:my-subagents      # or git:…, or a local path; -l for project scope
 ```
 
-**Declaration is required.** Pi falls back to convention directories (`skills/`, `prompts/`, …) for a package that has no `pi` key at all; this extension never does. A package that happens to carry an `agents/` folder for some other tool contributes nothing until it names it. That is the package author's half of the agreement; installing the package is yours.
+Four rules define the feature:
 
-**Only pi's own packages count.** Discovery reads `packages[]` from pi's `settings.json` (global `~/.pi/agent/settings.json` and project `.pi/settings.json`) through pi's package manager, so npm, git and local sources all resolve to the right install root. `node_modules` is never scanned — being a transitive dependency of your project means nothing here, exactly as it means nothing to pi. A package listed only by an untrusted project's settings stays invisible until you trust the project, again matching pi.
+- **Declaration is required.** Pi falls back to convention directories (`skills/`, `prompts/`, …) for a package with no `pi` key at all; this extension never does. A package carrying an `agents/` folder for some other tool contributes nothing until it names it — the author's half of the agreement, where installing is yours.
+- **Only pi's own packages count.** Discovery reads `packages[]` from pi's `settings.json`, global and project, through pi's package manager. `node_modules` is never scanned, and a package listed only by an untrusted project stays invisible until you trust it.
+- **Package agents rank last.** Any `.pi/agents/`, `.agents/agents/` or global file of the same name wins, so a package can offer a `reviewer` but never take the name away from you. Same tier pi gives package-provided skills, and Claude Code plugin agents.
+- **They are read-only in `/agents`,** badged `▪`, offering *Eject* (an editable copy that shadows the original) and *Disable* (an `enabled: false` stub that does the same).
 
-**Package agents always rank last.** Any `.pi/agents/`, `.agents/agents/` or global file with the same name wins, so a package can offer a `reviewer` but can never take the name away from you. This mirrors pi's own precedence for package-provided skills, and Claude Code's for plugin agents.
+`packageAgents` and `packageWorkflows` in [`subagents.json`](#persistent-settings) default to `true`; set either to `false` or to a list of package names to narrow it. Installing a package is already the trust decision — pi runs that package's `extensions/` and puts its `skills/` in the system prompt with no further prompt, so a declared `.md` agent is strictly less privileged than what it already runs.
 
-**They are read-only in `/agents`.** A package agent is listed with a `▪` badge and offers only *Eject* and *Disable*: its file lives under pi's install root, where an edit is lost on the next `pi update` and a delete is undone by the next `pi install`. *Eject* copies it into your project or personal directory as an editable file that shadows the original; *Disable* writes an `enabled: false` stub that does the same.
-
-**Turning it off.** `packageAgents` and `packageWorkflows` in [`subagents.json`](#persistent-settings) both default to `true`. Set either to `false`, or to a list of package names, to narrow what loads:
-
-```json
-{
-  "packageAgents": ["my-subagents"],
-  "packageWorkflows": false
-}
-```
-
-A list entry matches the unscoped short name (`@acme/tools` → `tools`), the full package name, or the settings source string, case-insensitively. Both settings also appear in `/agents → Settings`, which toggles them on and off — an allowlist is hand-written in `subagents.json`.
-
-Installing a package is already the trust decision: pi executes that package's `extensions/` and puts its `skills/` in the system prompt with no further prompt, so a declared `.md` agent is strictly less privileged than what the same package already runs. The gate is there for narrowing that anyway, not as a second install step.
+**Full guide:** [`docs/packages.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/packages.md) — manifest syntax and the four accepted spellings, `!` exclusions, the development loop, naming, precedence, and troubleshooting.
 
 ## Tools
 ### `Agent`

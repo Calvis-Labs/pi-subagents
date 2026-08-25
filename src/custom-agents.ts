@@ -7,6 +7,7 @@ import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import {
+  isPackageResourceExcluded,
   MAX_PACKAGE_RESOURCE_BYTES,
   packageAgentDirs,
   packageAgentFiles,
@@ -31,6 +32,9 @@ const RESERVED_IN_TYPE = ":";
 /** Where an agent file was found. Widens `AgentConfig.source` for the loader. */
 type AgentSource = "project" | "global" | "package";
 
+/** Answers whether a `!` entry in some package manifest excludes this path. */
+type Excluder = (path: string) => boolean;
+
 /**
  * Overrides for the package tier. The gate and project-trust state normally come
  * from the session values in package-resources.ts, so these exist for tests and
@@ -41,6 +45,8 @@ export interface LoadCustomAgentsOptions {
   packageDirs?: string[];
   /** Explicit package files, bypassing discovery. */
   packageFiles?: string[];
+  /** Explicit `!` exclusion predicate, bypassing discovery. */
+  packageExcluded?: Excluder;
 }
 
 /**
@@ -79,9 +85,12 @@ export function loadCustomAgents(
 
   const pkgDirs = opts.packageDirs ?? packageAgentDirs(cwd);
   const pkgFiles = opts.packageFiles ?? packageAgentFiles(cwd);
+  // `!./agents/wip.md` alongside `./agents` excludes one file out of a directory
+  // that is only enumerated here, so the check has to run per file.
+  const excluded: Excluder = opts.packageExcluded ?? (path => isPackageResourceExcluded(path, cwd, "agents"));
 
   const agents = new Map<string, AgentConfig>();
-  for (const dir of pkgDirs) loadFromDir(dir, agents, "package", strict);  // lowest priority
+  for (const dir of pkgDirs) loadFromDir(dir, agents, "package", strict, excluded); // lowest priority
   for (const file of pkgFiles) loadOneFile(file, agents, "package", strict);
   loadFromDir(globalDir, agents, "global", strict);
   loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
@@ -92,8 +101,14 @@ export function loadCustomAgents(
   return agents;
 }
 
-/** Load agent configs from a directory into the map. */
-function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: AgentSource, strict: boolean): void {
+/** Load agent configs from a directory into the map, skipping any `excluded` path. */
+function loadFromDir(
+  dir: string,
+  agents: Map<string, AgentConfig>,
+  source: AgentSource,
+  strict: boolean,
+  excluded?: Excluder,
+): void {
   if (!existsSync(dir)) return;
 
   let files: string[];
@@ -104,7 +119,9 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: Agen
   }
 
   for (const file of files) {
-    loadOneFile(join(dir, file), agents, source, strict);
+    const path = join(dir, file);
+    if (excluded?.(path)) continue;
+    loadOneFile(path, agents, source, strict);
   }
 }
 
@@ -127,7 +144,13 @@ function loadOneFile(path: string, agents: Map<string, AgentConfig>, source: Age
     return;
   }
 
-  const parsed = readAgentFile(path, strict);
+  // `strict` is deliberately not passed for a package file. Failing activation
+  // over a broken agent file is right for a checked-in `.pi/agents/` — the point
+  // is that a repo's own file cannot silently fall through to a same-named one
+  // elsewhere. A file inside a third-party package is not the user's to fix, and
+  // one bad `.md` in any installed package would otherwise stop pi from
+  // starting at all. Warn and skip, as for a non-strict local file.
+  const parsed = readAgentFile(path, strict && source !== "package");
   if (!parsed) {
     warnSkippedOverride(filenameType, agents);
     return;

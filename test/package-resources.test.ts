@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -101,11 +101,38 @@ describe("resolveDeclaredPaths", () => {
     // A package manifest is third-party input; `../..` must not become a
     // scanned directory. Pi refuses the same shape in its own resolver.
     expect(resolveDeclaredPaths(root, ["../", "../../etc", "/etc"], "agents"))
-      .toEqual({ dirs: [], files: [] });
+      .toMatchObject({ dirs: [], files: [] });
+  });
+
+  it("refuses a symlink that points out of the package root", () => {
+    // `..` is not the only way out: `readdirSync` follows a symlinked directory,
+    // so the containment check has to run on canonical paths.
+    const outside = mkdtempSync(join(tmpdir(), "pi-outside-"));
+    try {
+      writeFileSync(join(outside, "sneaky.md"), "x");
+      symlinkSync(outside, join(root, "escape"), "dir");
+      expect(resolveDeclaredPaths(root, ["./escape"], "agents")).toMatchObject({ dirs: [], files: [] });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("still resolves a package installed under a symlinked path", () => {
+    // Both sides are canonicalized, so `/var` -> `/private/var` on macOS does
+    // not make a package fail its own containment check.
+    const linkDir = mkdtempSync(join(tmpdir(), "pi-link-"));
+    const link = join(linkDir, "pkg");
+    try {
+      symlinkSync(root, link, "dir");
+      expect(resolveDeclaredPaths(link, ["./agents"], "agents").dirs).toEqual([join(link, "agents")]);
+    } finally {
+      unlinkSync(link);
+      rmSync(linkDir, { recursive: true, force: true });
+    }
   });
 
   it("drops entries that do not exist", () => {
-    expect(resolveDeclaredPaths(root, ["./nope"], "agents")).toEqual({ dirs: [], files: [] });
+    expect(resolveDeclaredPaths(root, ["./nope"], "agents")).toMatchObject({ dirs: [], files: [] });
   });
 
   it("de-duplicates repeated entries", () => {
@@ -114,7 +141,26 @@ describe("resolveDeclaredPaths", () => {
   });
 
   it("returns nothing for an absent declaration", () => {
-    expect(resolveDeclaredPaths(root, undefined, "workflows")).toEqual({ dirs: [], files: [] });
+    expect(resolveDeclaredPaths(root, undefined, "workflows")).toMatchObject({ dirs: [], files: [] });
+  });
+
+  it("records a ! entry naming a file inside an included directory", () => {
+    // The exclusion cannot be subtracted from `dirs` here — the directory is
+    // only enumerated at load time — so it is carried separately.
+    const { dirs, excluded } = resolveDeclaredPaths(root, ["./agents", "!./agents/one.md"], "agents");
+    expect(dirs).toEqual([join(root, "agents")]);
+    expect([...excluded]).toEqual([realpathSync(join(root, "agents", "one.md"))]);
+  });
+
+  it("records a ! entry for a path that does not exist", () => {
+    // A package may exclude something it ships conditionally; the exclusion has
+    // to survive so the file is still skipped if a later version adds it.
+    const { excluded } = resolveDeclaredPaths(root, ["./agents", "!./agents/later.md"], "agents");
+    expect(excluded.size).toBe(1);
+  });
+
+  it("ignores a ! entry pointing outside the package root", () => {
+    expect(resolveDeclaredPaths(root, ["./agents", "!../../etc/passwd"], "agents").excluded.size).toBe(0);
   });
 });
 
@@ -125,6 +171,7 @@ describe("packageAllowed", () => {
     shortName: "tools",
     scope: "user" as const,
     root: "/somewhere",
+    declared: { agents: ["./agents"] },
   };
 
   it("admits everything for true and for an unset gate", () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1159,6 +1159,34 @@ Good body.`);
         .toEqual(["Explore", "Plan"]);
     });
 
+    // Eject only ever ran on built-in defaults before package agents became
+    // ejectable, so these three fields had no way to reach the writer. A package
+    // agent can carry all of them, and the ejected copy SHADOWS the package
+    // file — so anything dropped here is silently lost from the running agent.
+    it("preserves ext: selectors alongside the built-in tool list", () => {
+      const loaded = roundTrip({ builtinToolNames: ["read", "grep"], extSelectors: ["ext:mcp/github"] });
+      expect(loaded.builtinToolNames).toEqual(["read", "grep"]);
+      expect(loaded.extSelectors).toEqual(["ext:mcp/github"]);
+    });
+
+    it("preserves ext: selectors when there are no built-ins", () => {
+      // Not `none`: zero built-ins with selectors present means "extension tools
+      // only", which is a wider grant than none and has to survive the trip.
+      const loaded = roundTrip({ builtinToolNames: [], extSelectors: ["ext:mcp/github"] });
+      expect(loaded.builtinToolNames).toEqual([]);
+      expect(loaded.extSelectors).toEqual(["ext:mcp/github"]);
+    });
+
+    it("preserves persist_session in both directions, and session_dir", () => {
+      expect(roundTrip({ persistSession: true, sessionDir: "/tmp/sessions" }))
+        .toMatchObject({ persistSession: true, sessionDir: "/tmp/sessions" });
+      expect(roundTrip({ persistSession: false }).persistSession).toBe(false);
+    });
+
+    it("preserves a tool-less agent as none, not as the whole toolbox", () => {
+      expect(roundTrip({ builtinToolNames: [] }).builtinToolNames).toEqual([]);
+    });
+
     it("preserves a description containing a colon", () => {
       // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
       expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
@@ -1298,6 +1326,44 @@ describe("package-provided agents", () => {
 
     const agents = loadCustomAgents(tmpDir, false, { packageDirs: [pkgDir, second] });
     expect(agents.get("shared")?.description).toBe("second");
+  });
+
+  it("does not let strictAgentFiles abort a load over a third-party package file", () => {
+    // Strict mode exists so a checked-in `.pi/agents/` fails loudly rather than
+    // falling through to a same-named agent elsewhere. A file inside an
+    // installed package is not the user's to fix, and throwing here would stop
+    // pi from starting at all over someone else's broken `.md`.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writePackageAgent("broken", "---\nname: [unclosed\n---\nBody.");
+      writePackageAgent("fine", "---\nname: fine\ndescription: ok\n---\nBody.");
+      expect(() => load(true)).not.toThrow();
+      expect(load(true).has("fine")).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still lets strictAgentFiles abort over a local file", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeLocalAgent(".pi", "broken", "---\nname: [unclosed\n---\nBody.");
+      expect(() => load(true)).toThrow(/broken\.md/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("skips a package file a ! manifest entry excluded", () => {
+    const path = writePackageAgent("wip", "---\nname: wip\ndescription: unfinished\n---\nB");
+    writePackageAgent("shipped", "---\nname: shipped\ndescription: ready\n---\nB");
+    const excluded = new Set([realpathSync(path)]);
+    const agents = loadCustomAgents(tmpDir, false, {
+      packageDirs: [pkgDir],
+      packageExcluded: p => excluded.has(realpathSync(p)),
+    });
+    expect(agents.has("shipped")).toBe(true);
+    expect(agents.has("wip")).toBe(false);
   });
 
   it("skips an unparseable package file without taking the load down", () => {

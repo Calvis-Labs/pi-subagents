@@ -33,7 +33,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
+import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -404,6 +404,9 @@ export default function (pi: ExtensionAPI) {
   // doing it here as well is what makes the *initial* registry honour them.
   setPackageAgentsGate(bootSettings.packageAgents);
   setPackageWorkflowsGate(bootSettings.packageWorkflows);
+  // And seed project trust from pi's saved decision, because the initial load is
+  // the one the `Agent` tool description is built from — see `seedProjectTrust`.
+  seedProjectTrust(process.cwd());
 
   /** Reload agents from package/global/project agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
@@ -3240,9 +3243,15 @@ Terse command-style prompts produce shallow, generic work.
 
     let menuOptions: string[];
     if (isPackage) {
-      // Read-only. A disabled package agent has been shadowed by a local stub,
-      // so it is that stub's own row that offers Enable.
-      menuOptions = ["Eject (export as .md)", "Disable", "Back"];
+      // Read-only: nothing here may write inside pi's install root. `Disable`
+      // still appears because it writes a *local* stub that shadows the package
+      // agent, and `Enable` never does — a package agent that reads as disabled
+      // was disabled by its own author's `enabled: false`, which only the
+      // package can take back. Eject is the way out of that: the copy it writes
+      // carries no `enabled:` line, so the ejected agent is on.
+      menuOptions = disabled
+        ? ["Eject (export as .md)", "Back"]
+        : ["Eject (export as .md)", "Disable", "Back"];
     } else if (disabled && file) {
       // Disabled agent with a file — offer Enable
       menuOptions = isDefault
@@ -4018,7 +4027,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const replaced = Array.isArray(previous) && previous.length > 0
           ? ` Replaced the allowlist (${previous.join(", ")}) — re-add it in .pi/subagents.json to narrow it again.`
           : "";
-        notifyApplied(ctx, `${label} ${enabled ? "enabled" : "disabled"}.${replaced}`);
+        // Same caveat every row that changes the advertised agent set carries:
+        // the `Agent` tool's description and schema are built at registration,
+        // so until the next session the model is reading a stale type list.
+        const specNote = isAgents ? " Tool spec change takes effect on next pi session." : "";
+        notifyApplied(ctx, `${label} ${enabled ? "enabled" : "disabled"}.${replaced}${specNote}`);
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);

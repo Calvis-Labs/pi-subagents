@@ -390,15 +390,19 @@ const SUBAGENT_DEPTH_CEILING = 16;
 
 /**
  * Normalize a package gate: a boolean passes through, an array is trimmed to its
- * non-empty string entries, anything else is dropped.
+ * non-empty string entries, a bare string becomes a one-entry allowlist, and
+ * anything else is dropped.
  *
- * An array that trims to empty is kept as `[]` rather than dropped, because the
- * two do not mean the same thing here: dropping it would restore the `true`
- * default and silently load every package's agents, which is the opposite of
- * what someone who wrote a list meant. `[]` matches nothing, like `false`.
+ * The two coercions exist for the same reason: this setting's default is `true`,
+ * so *dropping* a malformed value silently admits every package — the opposite
+ * of what someone narrowing the gate meant. So an array that trims to empty is
+ * kept as `[]` (matching nothing, like `false`) rather than dropped, and
+ * `"my-package"` — the obvious typo for a one-entry list — is read as
+ * `["my-package"]` rather than widened to everything.
  */
 function sanitizePackageGate(val: unknown): boolean | string[] | undefined {
   if (typeof val === "boolean") return val;
+  if (typeof val === "string") return val.trim() ? [val.trim()] : [];
   if (!Array.isArray(val)) return undefined;
   return val.filter((e): e is string => typeof e === "string").map(e => e.trim()).filter(Boolean);
 }

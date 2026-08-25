@@ -53,9 +53,9 @@
  * `extensions`/`skills`/`prompts`/`themes` and ignores every other key.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { DefaultPackageManager, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { DefaultPackageManager, getAgentDir, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 /** Resource kinds a package may declare. Agents are `.md`, workflows are `.js`. */
 export type PackageResourceKind = "agents" | "workflows";
@@ -86,6 +86,13 @@ export interface PiPackage {
   scope: "user" | "project";
   /** Absolute path of the installed package root. */
   root: string;
+  /**
+   * What its manifest declared. Carried here rather than re-read downstream:
+   * `listPiPackages` has to parse the manifest anyway to know whether the
+   * package declares anything at all, and reading it twice would leave two
+   * places that could disagree about what a package said.
+   */
+  declared: DeclaredEntries;
 }
 
 /**
@@ -151,6 +158,42 @@ export function getPackageWorkflowsGate(): PackageGate {
 }
 
 /**
+ * Seed the trust state from pi's *saved* decision, before any session exists.
+ *
+ * The correction on `session_start` is too late for one thing that matters: the
+ * `Agent` tool's description — the list of agent types the model is told about —
+ * is built once at activation, so an agent registered after it never reaches the
+ * model even though dispatch would accept it. That is exactly the shape a team
+ * ships agents in: a package named in a committed `.pi/settings.json`, which is
+ * invisible until the project is trusted.
+ *
+ * Pi keeps that decision in `<agentDir>/trust.json`, keyed by canonical path
+ * with the nearest ancestor winning, so on the second and every later session in
+ * a trusted repo the answer is already on disk. No saved decision falls back to
+ * the global `defaultProjectTrust`, which is what pi does; `"ask"` resolves to
+ * untrusted here, because the prompt has not been answered yet and guessing yes
+ * would be the wrong direction to guess.
+ *
+ * Best-effort by design: any failure leaves the state untrusted, and
+ * `session_start` still delivers pi's real answer either way.
+ */
+export function seedProjectTrust(cwd: string): void {
+  try {
+    if (typeof ProjectTrustStore !== "function") return;
+    const agentDir = getAgentDir();
+    const saved = new ProjectTrustStore(agentDir).get(cwd);
+    if (typeof saved === "boolean") {
+      setProjectTrusted(saved);
+      return;
+    }
+    const settings = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+    setProjectTrusted(settings.getGlobalSettings().defaultProjectTrust === "always");
+  } catch {
+    // Leave it untrusted; session_start corrects it.
+  }
+}
+
+/**
  * Record pi's project-trust answer. Drops the cache when the answer changes,
  * since a project's `packages[]` becomes visible or invisible with it. A repeat
  * of the same answer is a no-op — `session_start` fires on every new, resumed
@@ -160,10 +203,6 @@ export function setProjectTrusted(trusted: boolean): void {
   if (projectTrustedState === trusted) return;
   projectTrustedState = trusted;
   invalidatePackageCache();
-}
-
-export function isProjectTrusted(): boolean {
-  return projectTrustedState;
 }
 
 /** Reset every session-scoped value. Tests only — the extension never un-loads. */
@@ -184,6 +223,12 @@ export interface DeclaredEntries {
 export interface ResolvedResourcePaths {
   dirs: string[];
   files: string[];
+  /**
+   * Canonical paths of `!` entries. Kept separate from `dirs`/`files` rather
+   * than subtracted from them because an exclusion usually names a file *inside*
+   * an included directory, which is not enumerated until load time.
+   */
+  excluded: ReadonlySet<string>;
 }
 
 // ---- Manifest reading ----
@@ -246,12 +291,36 @@ export function unscopedShortName(name: string): string {
 // ---- Path resolution ----
 
 /**
+ * Canonical absolute path, resolving symlinks as far as the path exists.
+ *
+ * A plain `realpathSync` is not enough: an exclusion may name a file the package
+ * does not ship yet, and a bare `resolve()` fallback would leave it uncanonical
+ * — which on macOS means `/var/...` compared against a canonical `/private/var/...`
+ * root, so the containment check below rejects it. Canonicalizing the nearest
+ * existing ancestor and re-appending the rest keeps both sides comparable.
+ */
+function realOrSelf(path: string): string {
+  const abs = resolve(path);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(realOrSelf(parent), basename(abs));
+  }
+}
+
+/**
  * True when `candidate` is inside `root`. Package manifests are third-party
  * input, so `"../../.ssh"` must not become a scanned directory — pi refuses the
  * same shape with "Refusing to use path outside package install root".
+ *
+ * Compared on canonical paths, because `..` is not the only way out: a symlinked
+ * `agents/` pointing at `/etc` is textually inside the root, and `readdirSync`
+ * follows it. Both sides are canonicalized so a package installed *under* a
+ * symlink (`/var` → `/private/var` on macOS) still matches itself.
  */
 function isInside(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
+  const rel = relative(realOrSelf(root), realOrSelf(candidate));
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
@@ -278,7 +347,8 @@ function expandEntry(root: string, entry: string): string | undefined {
  * takes directories (it does its own `readdirSync` and frontmatter handling),
  * while a manifest entry naming a single file has to be surfaced on its own.
  *
- * `!entry` marks an exclusion, matching pi's manifest semantics.
+ * `!entry` marks an exclusion. Exact paths only — pi's own `!` is gitignore-style
+ * glob negation, and globs are not supported here for the reason above.
  */
 export function resolveDeclaredPaths(
   root: string,
@@ -287,20 +357,23 @@ export function resolveDeclaredPaths(
 ): ResolvedResourcePaths {
   const dirs: string[] = [];
   const files: string[] = [];
-  if (!entries) return { dirs, files };
-
   const excluded = new Set<string>();
+  if (!entries) return { dirs, files, excluded };
+
+  // Exclusions are collected first and stored canonically, so `!./agents/wip.md`
+  // matches the same file however the loader spelled its way to it. They do not
+  // have to exist: a package may exclude a path it ships conditionally.
   for (const entry of entries) {
     if (!entry.startsWith("!")) continue;
-    const path = expandEntry(root, entry.slice(1));
-    if (path) excluded.add(path);
+    const target = resolve(root, entry.slice(1));
+    if (isInside(root, target)) excluded.add(realOrSelf(target));
   }
 
   const ext = KIND_EXTENSION[kind];
   for (const entry of entries) {
     if (entry.startsWith("!")) continue;
     const path = expandEntry(root, entry);
-    if (!path || excluded.has(path)) continue;
+    if (!path || excluded.has(realOrSelf(path))) continue;
     let stat: ReturnType<typeof statSync>;
     try {
       stat = statSync(path);
@@ -313,7 +386,7 @@ export function resolveDeclaredPaths(
       files.push(path);
     }
   }
-  return { dirs, files };
+  return { dirs, files, excluded };
 }
 
 // ---- Package enumeration ----
@@ -356,7 +429,8 @@ export function listPiPackages(cwd: string, projectTrusted = false): PiPackage[]
     const root = entry.installedPath;
     if (!root || seen.has(root)) continue;
     const manifest = readPackageJson(root);
-    if (!manifest || !readSubagentManifest(manifest)) continue;
+    const declared = manifest ? readSubagentManifest(manifest) : undefined;
+    if (!manifest || !declared) continue;
     seen.add(root);
     const name = typeof manifest.name === "string" ? manifest.name : undefined;
     out.push({
@@ -365,6 +439,7 @@ export function listPiPackages(cwd: string, projectTrusted = false): PiPackage[]
       shortName: name ? unscopedShortName(name) : undefined,
       scope: entry.scope,
       root,
+      declared,
     });
   }
   return out;
@@ -405,6 +480,11 @@ interface CacheEntry {
   agents: ResolvedResourcePaths;
   workflows: ResolvedResourcePaths;
 }
+
+/** A resolved-paths value with nothing in it. Fresh each call — callers get copies. */
+function emptyPaths(): ResolvedResourcePaths {
+  return { dirs: [], files: [], excluded: new Set() };
+}
 const cache = new Map<string, CacheEntry>();
 
 /** Drop the memoized package scan. Called on `/reload` and after settings changes. */
@@ -413,16 +493,18 @@ export function invalidatePackageCache(): void {
 }
 
 function scan(cwd: string, projectTrusted: boolean, gate: PackageGate): CacheEntry {
-  const entry: CacheEntry = { agents: { dirs: [], files: [] }, workflows: { dirs: [], files: [] } };
+  const agents = emptyPaths();
+  const workflows = emptyPaths();
+  const entry: CacheEntry = { agents, workflows };
   for (const pkg of listPiPackages(cwd, projectTrusted)) {
     if (!packageAllowed(pkg, gate)) continue;
-    const manifest = readPackageJson(pkg.root);
-    const declared = manifest ? readSubagentManifest(manifest) : undefined;
-    if (!declared) continue;
     for (const kind of ["agents", "workflows"] as const) {
-      const { dirs, files } = resolveDeclaredPaths(pkg.root, declared[kind], kind);
-      entry[kind].dirs.push(...dirs);
-      entry[kind].files.push(...files);
+      const resolvedPaths = resolveDeclaredPaths(pkg.root, pkg.declared[kind], kind);
+      entry[kind].dirs.push(...resolvedPaths.dirs);
+      entry[kind].files.push(...resolvedPaths.files);
+      // One flat set across packages: an exclusion is an absolute path, so it
+      // can only ever match inside the package that wrote it.
+      for (const path of resolvedPaths.excluded) (entry[kind].excluded as Set<string>).add(path);
     }
   }
   return entry;
@@ -432,9 +514,12 @@ function resolved(cwd: string, kind: PackageResourceKind, opts: PackageDiscovery
   const gate = opts.gate ?? (kind === "agents" ? agentsGate : workflowsGate);
   // An empty allowlist matches nothing, like `false` — see `sanitizePackageGate`
   // in settings.ts for why an empty array is kept rather than dropped.
-  if (gate === false || (Array.isArray(gate) && gate.length === 0)) return { dirs: [], files: [] };
+  if (gate === false || (Array.isArray(gate) && gate.length === 0)) return emptyPaths();
   const projectTrusted = opts.projectTrusted ?? projectTrustedState;
-  const key = `${cwd} ${projectTrusted ? 1 : 0} ${JSON.stringify(gate ?? true)}`;
+  // `\u0000` written as an escape, not a raw byte: a literal NUL makes this
+  // whole file read as binary to grep, ripgrep and git, which silently drops
+  // it from search results.
+  const key = `${cwd}\u0000${projectTrusted ? 1 : 0}\u0000${JSON.stringify(gate ?? true)}`;
   let hit = cache.get(key);
   if (!hit) {
     hit = scan(cwd, projectTrusted, gate);
@@ -459,16 +544,49 @@ export function packageAgentFiles(cwd: string, opts: PackageDiscoveryOptions = {
 }
 
 /**
+ * Whether a `!` entry in some package manifest excludes this path.
+ *
+ * Checked at load time rather than subtracted during resolution, because the
+ * common exclusion — `["./agents", "!./agents/wip.md"]` — names a file inside a
+ * directory that is not enumerated until the loader reads it.
+ */
+export function isPackageResourceExcluded(
+  path: string,
+  cwd: string,
+  kind: PackageResourceKind,
+  opts: PackageDiscoveryOptions = {},
+): boolean {
+  const excluded = resolved(cwd, kind, opts).excluded;
+  return excluded.size > 0 && excluded.has(realOrSelf(path));
+}
+
+/**
  * Directories of package-declared workflow scripts, appended to
  * `savedWorkflowRoots` so a name resolves there last.
  */
 export function packageWorkflowDirs(cwd: string, opts: PackageDiscoveryOptions = {}): string[] {
-  const { dirs, files } = resolved(cwd, "workflows", opts);
-  // A declared workflow *file* has no root for a name lookup, so its parent
-  // directory stands in. That widens the root to the file's siblings, which is
-  // safe: `readSavedWorkflow` and `listSavedWorkflows` both require the
-  // `export const meta =` declaration, so a sibling that is not a workflow is
-  // never offered as one.
-  const fromFiles = files.map(f => dirname(f));
-  return [...dirs, ...fromFiles.filter(d => !dirs.includes(d))];
+  return [...resolved(cwd, "workflows", opts).dirs];
+}
+
+/**
+ * Individually declared workflow scripts, as `name -> absolute path`.
+ *
+ * A name lookup wants a directory, and a declared *file* has none — but standing
+ * its parent directory in as a root would make every sibling `.js` resolvable,
+ * so `workflows: ["./one.js"]` would quietly offer the package's other scripts
+ * too, and `["./index.js"]` would offer everything at the package root. That is
+ * the opposite of the rule the whole feature rests on, that a package only
+ * contributes what it names. An exact map keeps the declaration honest, and
+ * matches how a declared agent file is already handled.
+ *
+ * Later entries lose a name clash, so a package's own directory-sourced script
+ * is not displaced by a file entry from a package resolved after it.
+ */
+export function packageWorkflowFiles(cwd: string, opts: PackageDiscoveryOptions = {}): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const path of resolved(cwd, "workflows", opts).files) {
+    const name = basename(path, KIND_EXTENSION.workflows);
+    if (!out.has(name)) out.set(name, path);
+  }
+  return out;
 }

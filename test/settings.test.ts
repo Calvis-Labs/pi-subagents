@@ -216,10 +216,20 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ packageAgents: [] });
   });
 
-  it("drops a packageAgents value that is neither a boolean nor an array", () => {
-    writeProject({ packageAgents: "on" } as any);
-    expect(loadSettings(projectDir)).toEqual({});
+  it("reads a bare string as a one-entry allowlist, not as garbage to drop", () => {
+    // This setting defaults to `true`, so dropping a malformed value silently
+    // admits every package — the opposite of what someone narrowing the gate
+    // meant. `"my-pkg"` is the obvious typo for `["my-pkg"]`, so read it as one.
+    writeProject({ packageAgents: "my-pkg" } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["my-pkg"] });
+    writeProject({ packageAgents: "   " } as any);
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: [] });
+  });
+
+  it("drops a packageAgents value that is neither a boolean, a string, nor an array", () => {
     writeProject({ packageWorkflows: { allow: [] } } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ packageAgents: 7 } as any);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
