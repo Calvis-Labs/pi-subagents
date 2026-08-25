@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { MAX_PACKAGE_RESOURCE_BYTES } from "../src/package-resources.js";
 import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
@@ -1162,5 +1163,152 @@ Good body.`);
       // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
       expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
     });
+  });
+});
+
+describe("package-provided agents", () => {
+  let tmpDir: string;
+  let pkgDir: string;
+  let originalHome: string | undefined;
+  let originalAgentDir: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-test-pkg-"));
+    pkgDir = join(tmpDir, "package", "agents");
+    mkdirSync(pkgDir, { recursive: true });
+    originalHome = process.env.HOME;
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = tmpDir;
+    delete process.env.PI_CODING_AGENT_DIR;
+  });
+
+  afterEach(() => {
+    if (originalHome == null) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Write an agent into the fake package directory. */
+  function writePackageAgent(name: string, content: string): string {
+    const path = join(pkgDir, `${name}.md`);
+    writeFileSync(path, content);
+    return path;
+  }
+
+  /** Write an agent into one of the local roots. */
+  function writeLocalAgent(where: ".pi" | ".agents", name: string, content: string) {
+    const dir = join(tmpDir, where, "agents");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${name}.md`), content);
+  }
+
+  /** Load with the package tier pinned, bypassing pi's settings. */
+  function load(strict = false) {
+    return loadCustomAgents(tmpDir, strict, { packageDirs: [pkgDir] });
+  }
+
+  it("registers an agent from a package directory", () => {
+    writePackageAgent("researcher", "---\nname: researcher\ndescription: From a package\n---\nBody.");
+    const agent = load().get("researcher");
+    expect(agent?.description).toBe("From a package");
+    expect(agent?.source).toBe("package");
+    expect(agent?.sourcePath).toBe(join(pkgDir, "researcher.md"));
+  });
+
+  it("registers an individually declared package file", () => {
+    const path = writePackageAgent("solo", "---\nname: solo\ndescription: One file\n---\nBody.");
+    const agents = loadCustomAgents(tmpDir, false, { packageDirs: [], packageFiles: [path] });
+    expect(agents.get("solo")?.source).toBe("package");
+  });
+
+  it("loses the name to a global agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    const globalDir = join(tmpDir, ".pi", "agent", "agents");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "reviewer.md"), "---\nname: reviewer\ndescription: global\n---\nG");
+
+    const agent = load().get("reviewer");
+    expect(agent?.description).toBe("global");
+    expect(agent?.source).toBe("global");
+  });
+
+  it("loses the name to a project agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "reviewer", "---\nname: reviewer\ndescription: project\n---\nJ");
+
+    const agent = load().get("reviewer");
+    expect(agent?.description).toBe("project");
+    expect(agent?.source).toBe("project");
+  });
+
+  it("loses the name to a workspace agent", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".agents", "reviewer", "---\nname: reviewer\ndescription: workspace\n---\nW");
+
+    expect(load().get("reviewer")?.description).toBe("workspace");
+  });
+
+  it("is disabled by a local stub, which is how /agents turns one off", () => {
+    writePackageAgent("reviewer", "---\nname: reviewer\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "reviewer", "---\nenabled: false\n---\n");
+
+    const agent = load().get("reviewer");
+    expect(agent?.enabled).toBe(false);
+    expect(agent?.source).toBe("project");
+  });
+
+  it("keeps a package agent the local roots do not claim", () => {
+    writePackageAgent("pkg-only", "---\nname: pkg-only\ndescription: package\n---\nP");
+    writeLocalAgent(".pi", "other", "---\nname: other\ndescription: project\n---\nJ");
+
+    const agents = load();
+    expect(agents.get("pkg-only")?.source).toBe("package");
+    expect(agents.get("other")?.source).toBe("project");
+  });
+
+  it("skips a package agent file larger than the 1 MB ceiling", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const body = "x".repeat(MAX_PACKAGE_RESOURCE_BYTES + 1);
+      writePackageAgent("huge", `---\nname: huge\ndescription: big\n---\n${body}`);
+      expect(load().has("huge")).toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Skipping package agent"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not apply the size ceiling to the user's own agent files", () => {
+    // The ceiling exists because package files are third-party content read on
+    // every spawn. A local file is the user's own and stays unbounded.
+    const dir = join(tmpDir, ".pi", "agents");
+    mkdirSync(dir, { recursive: true });
+    const body = "x".repeat(MAX_PACKAGE_RESOURCE_BYTES + 1);
+    writeFileSync(join(dir, "huge.md"), `---\nname: huge\ndescription: big\n---\n${body}`);
+    expect(load().get("huge")?.source).toBe("project");
+  });
+
+  it("loads later package directories over earlier ones on a name clash", () => {
+    const second = join(tmpDir, "package-two", "agents");
+    mkdirSync(second, { recursive: true });
+    writePackageAgent("shared", "---\nname: shared\ndescription: first\n---\nA");
+    writeFileSync(join(second, "shared.md"), "---\nname: shared\ndescription: second\n---\nB");
+
+    const agents = loadCustomAgents(tmpDir, false, { packageDirs: [pkgDir, second] });
+    expect(agents.get("shared")?.description).toBe("second");
+  });
+
+  it("skips an unparseable package file without taking the load down", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writePackageAgent("broken", "---\nname: [unclosed\n---\nBody.");
+      writePackageAgent("fine", "---\nname: fine\ndescription: ok\n---\nBody.");
+      expect(load().has("fine")).toBe(true);
+      expect(load().has("broken")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

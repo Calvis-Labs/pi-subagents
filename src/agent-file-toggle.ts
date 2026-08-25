@@ -57,7 +57,7 @@ export function findAgentFile(
 }
 
 /**
- * Find the file behind a *loaded* agent, preferring the path the loader
+ * Find the *editable* file behind a loaded agent, preferring the path the loader
  * actually read (`AgentConfig.sourcePath`) over the `<type>.md` guess.
  *
  * An agent's type comes from its frontmatter `name:` now, so the two can
@@ -69,13 +69,22 @@ export function findAgentFile(
  *
  * The probe stays as the fallback: a built-in that was never ejected has no
  * `sourcePath`, and a path can go stale between a load and this call.
+ *
+ * **A package agent has no editable file.** Its `sourcePath` points inside pi's
+ * install root, where an edit is lost on the next `pi update` and a delete is
+ * undone by the next `pi install`. Passing `source` lets that rule live here
+ * rather than at each `/agents` call site: the package path is ignored, and the
+ * name probe runs instead — which finds the local stub shadowing it, if one
+ * exists, and otherwise nothing. Callers then take their no-file branch, which
+ * is the Eject-or-shadow behaviour a not-yet-ejected builtin already gets.
  */
 export function locateAgentFile(
   name: string,
   sourcePath: string | undefined,
   cwd: string = process.cwd(),
+  source?: AgentConfig["source"],
 ): { path: string; location: AgentFileLocation } | undefined {
-  if (sourcePath && existsSync(sourcePath)) {
+  if (source !== "package" && sourcePath && existsSync(sourcePath)) {
     return { path: sourcePath, location: classifyAgentDir(sourcePath, cwd) };
   }
   return findAgentFile(name, cwd);
@@ -83,9 +92,11 @@ export function locateAgentFile(
 
 /**
  * Which discovery location a loaded agent's file came from. Only ever names
- * a directory in a confirmation prompt, so an unrecognized parent — which
- * loadCustomAgents cannot currently produce — reports as personal rather than
- * widening the type for a case that has no better answer.
+ * a directory in a confirmation prompt, so an unrecognized parent reports as
+ * personal rather than widening the type for a case that has no better answer.
+ *
+ * Package-provided paths never reach here: `locateAgentFile` drops them above,
+ * because none of the three locations this classifies is where they live.
  */
 function classifyAgentDir(path: string, cwd: string): AgentFileLocation {
   if (path.startsWith(projectAgentsDir(cwd) + sep)) return "project";

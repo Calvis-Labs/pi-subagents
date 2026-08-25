@@ -41,18 +41,32 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isSymlink, isUnsafeName, safeReadFile } from "../memory.js";
+import { packageWorkflowDirs } from "../package-resources.js";
 import { hasMetaDeclaration } from "./meta.js";
 import { MAX_SCRIPT_LENGTH } from "./runtime.js";
 
 /** Extension a saved workflow file carries. */
 const WORKFLOW_EXTENSION = ".js";
 
-/** The roots a `name` is looked up in, highest priority first. */
+/**
+ * The roots a `name` is looked up in, highest priority first.
+ *
+ * Directories declared by installed pi packages come last, so a project, shared
+ * workspace or personal script always wins the name. That is the same tier
+ * package-provided agents get, and the same tier pi gives package-provided
+ * skills — a package offers a workflow, it never takes a name away from you.
+ *
+ * The `packageWorkflows` gate and pi's project-trust answer are session state in
+ * package-resources.ts rather than parameters here, so a gate set in `/agents`
+ * reaches this without an options bag travelling through `resolveWorkflowScript`,
+ * `resolveWorkflowSource` and `readSavedWorkflow` purely to be consulted once.
+ */
 export function savedWorkflowRoots(cwd: string): string[] {
   return [
     join(cwd, ".pi", "workflows"),
     join(cwd, ".agents", "workflows"),
     join(getAgentDir(), "workflows"),
+    ...packageWorkflowDirs(cwd),
   ];
 }
 
