@@ -165,4 +165,60 @@ describe("background completion steering scheduling", () => {
     expect(parentModelCalls).toBeGreaterThanOrEqual(2);
     expect(childModelCalls).toBe(1);
   });
+
+  it("delivers children that finished during one tool batch together, in one message", async () => {
+    cwd = mkdtempSync(join(tmpdir(), "subagents-steer-scheduling-"));
+
+    let release!: () => void;
+    let entered!: () => void;
+    const blockingToolEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let completions = 0;
+    let bothCompleted!: () => void;
+    const bothChildrenCompleted = new Promise<void>((resolve) => { bothCompleted = resolve; });
+    (globalThis as Record<symbol, unknown>)[BLOCKING_TOOL_CONTROL] = {
+      agentCompleted: () => { if (++completions === 2) bothCompleted(); },
+      entered: () => entered(),
+      release: new Promise<void>((resolve) => { release = resolve; }),
+      completed: () => {},
+    };
+    releaseBlockedTool = () => release();
+
+    // What the parent's next model call sees: one entry per message carrying a completion.
+    let completionMessagesAtSecondCall: string[] | undefined;
+    let parentModelCalls = 0;
+
+    const runPromise = runPrintMode({
+      cwd,
+      hold: false,
+      extensionPaths: [BLOCKING_TOOL_EXTENSION],
+      prompt: "Start two background children and keep working with a blocking tool.",
+      respond: async (context) => {
+        if (!getCurrentTools(context.messages).some((tool) => tool.name === "Agent")) return COMPLETION_MARKER;
+        parentModelCalls++;
+        if (parentModelCalls === 1) {
+          return [
+            agentCall({ description: "first child", prompt: "first", run_in_background: true }, { id: "agent-1" }),
+            agentCall({ description: "second child", prompt: "second", run_in_background: true }, { id: "agent-2" }),
+            { type: "toolCall" as const, id: "blocking-call", name: "blocking_tool", arguments: {} },
+          ];
+        }
+        completionMessagesAtSecondCall ??= context.messages.flatMap((message) =>
+          message.role === "user"
+            ? message.content.flatMap((block) =>
+              block.type === "text" && block.text.includes(COMPLETION_MARKER) ? [block.text] : [])
+            : []);
+        return "done";
+      },
+    });
+
+    await blockingToolEntered;
+    await bothChildrenCompleted;
+    releaseBlockedTool?.();
+    releaseBlockedTool = undefined;
+    run = await runPromise;
+
+    expect(completionMessagesAtSecondCall).toHaveLength(1);
+    expect(completionMessagesAtSecondCall?.[0]).toContain("first child");
+    expect(completionMessagesAtSecondCall?.[0]).toContain("second child");
+  });
 });

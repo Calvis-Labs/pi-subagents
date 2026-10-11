@@ -22,6 +22,7 @@ import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -448,64 +449,47 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
+  // ---- Completion delivery ----
+  // Every completion notification goes through the outbox, which sends what is
+  // pending as one message at the parent's next boundary (see
+  // completion-outbox.ts). Items are built at send time, so a result consumed
+  // by get_subagent_result before then is never delivered.
+  const outbox = new CompletionOutbox(
+    (message, delivery) => pi.sendMessage<NotificationDetails>({
+      customType: "subagent-notification",
+      content: message.content,
+      display: true,
+      details: message.details,
+    }, delivery),
+    () => currentCtx?.signal !== undefined,
+  );
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
-  const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
-
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
-  }
-
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer,
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "steer", triggerTurn: true });
-  }
+  const QUEUE_WAIT_POLL_MS = Math.floor(NOTIFICATION_HOLD_MS / 4);
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    outbox.add(() => {
+      if (record.resultConsumed) return undefined;
+      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+      return {
+        content: formatTaskNotification(record, 500, showCost) + footer,
+        details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      };
+    });
     widget.update();
   }
 
-  // ---- Group join manager ----
+  // ---- Group join manager (`group` join mode only) ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
+      outbox.add(() => {
         const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
+        if (unconsumed.length === 0) return undefined;
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
         const label = partial
@@ -517,13 +501,10 @@ export default function (pi: ExtensionAPI) {
         if (rest.length > 0) {
           details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
         }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
+        return {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
           details,
-        }, { deliverAs: "steer", triggerTurn: true });
+        };
       });
       widget.update();
     },
@@ -601,9 +582,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    // A `group` spawn whose turn has not ended yet: its group is registered at
+    // that turn's end, which picks this completion up retroactively.
+    if (turnGroupSpawns.includes(record.id)) {
       widget.update();
       return;
     }
@@ -821,7 +802,6 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
             return true;
           },
         },
@@ -1117,8 +1097,7 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    outbox.dispose();
     fleet.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
@@ -1312,45 +1291,36 @@ export default function (pi: ExtensionAPI) {
   function getToolDescriptionMode(): ToolDescriptionMode { return toolDescriptionMode; }
   function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
-  // ---- Batch tracking for smart join mode ----
-  // Collects background agent IDs spawned in the current turn for smart grouping.
-  // Uses a debounced timer: each new agent resets the 100ms window so that all
-  // parallel tool calls (which may be dispatched across multiple microtasks by the
-  // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
-  let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
-  let batchCounter = 0;
+  // ---- Turn batches for `group` join mode ----
+  // Background spawns the parent made in its current turn. The turn's end is
+  // the batch boundary: every `Agent` call of the batch has returned by then,
+  // so a spawn whose startup failed has already thrown and was never recorded,
+  // and a slow worktree copy cannot split the batch.
+  let turnGroupSpawns: string[] = [];
+  let turnGroupCounter = 0;
 
-  /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
-  function finalizeBatch() {
-    batchFinalizeTimer = undefined;
-    const batchAgents = [...currentBatchAgents];
-    currentBatchAgents = [];
+  /** Record a `group`-mode spawn made inside a parent turn. */
+  function joinTurnGroup(id: string, joinMode: JoinMode | undefined) {
+    // Outside a parent turn (an `@handle` mention) no turn end is coming, and a
+    // group of one is delivered exactly like a single completion.
+    if (joinMode === 'group' && currentCtx?.signal !== undefined) turnGroupSpawns.push(id);
+  }
 
-    const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
-    if (smartAgents.length >= 2) {
-      const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
-        }
-      }
-    } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+  /** Register the ending turn's `group` spawns as one group. */
+  function registerTurnGroup() {
+    const ids = turnGroupSpawns;
+    turnGroupSpawns = [];
+    if (ids.length === 0) return;
+    const groupId = `turn-${++turnGroupCounter}`;
+    groupJoin.registerGroup(groupId, ids);
+    // Members that finished before their turn ended had their completion
+    // deferred (see the manager's onComplete); feed them in now.
+    for (const id of ids) {
+      const record = manager.getRecord(id);
+      if (!record) continue;
+      record.groupId = groupId;
+      if (record.completedAt != null && !record.resultConsumed) {
+        groupJoin.onAgentComplete(record);
       }
     }
   }
@@ -1419,11 +1389,8 @@ export default function (pi: ExtensionAPI) {
     });
     if (!record) return undefined;
 
-    if (joinMode != null && joinMode !== 'async') {
-      currentBatchAgents.push({ id, joinMode });
-      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-      batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-    }
+    // Only a resume from an Agent call belongs to that call's turn.
+    if (opts.toolCallId !== undefined) joinTurnGroup(id, joinMode);
 
     agentActivity.set(id, bgState);
     // This agent already finished once, so the widget holds a finished-age
@@ -1456,6 +1423,14 @@ export default function (pi: ExtensionAPI) {
     watchHandoffKey(ctx.ui);
     widget.onTurnStart();
   });
+
+  // The parent's tool batch is done and its next model call not yet made: the
+  // boundary where completions are delivered, as in Claude Code.
+  pi.on("turn_end", (event) => {
+    registerTurnGroup();
+    outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
+  });
+  pi.on("agent_end", () => outbox.onAgentEnd());
 
   /** Build the full type list text dynamically from available agents only. */
   const buildTypeListText = () => {
@@ -2201,16 +2176,7 @@ Terse command-style prompts produce shallow, generic work.
         // call instead of being reported as a subagent that ran (#179).
         await manager.awaitStartup(id);
 
-        if (joinMode == null || joinMode === 'async') {
-          // Foreground/no join mode or explicit async — not part of any batch
-        } else {
-          // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
-          // Debounce: reset timer on each new agent so parallel tool calls
-          // dispatched across multiple event loop ticks are captured together
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
+        joinTurnGroup(id, joinMode);
 
         agentActivity.set(id, bgState);
         widget.ensureTimer();
@@ -2518,33 +2484,29 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a steering
-   * message that triggers a turn, rendered by the existing
-   * `subagent-notification` renderer.
+   * agent uses — the completion outbox, which delivers at the parent's next
+   * boundary — rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: formatWorkflowNotification(task),
-        display: true,
-        details: {
-          id: task.id,
-          description: `Workflow ${task.workflowName ?? task.id}`,
-          status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
-          toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "↻0" would be noise.
-          turnCount: 0,
-          totalTokens: task.totalTokens,
-          durationMs: elapsedMs(task, Date.now()),
-          error: task.error,
-          resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
-        },
-      }, { deliverAs: "steer", triggerTurn: true });
-    });
+    const durationMs = elapsedMs(task, Date.now());
+    outbox.add(() => ({
+      content: formatWorkflowNotification(task),
+      details: {
+        id: task.id,
+        description: `Workflow ${task.workflowName ?? task.id}`,
+        status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
+        toolUses: task.totalToolCalls,
+        // A workflow has agents, not turns; rendering "↻0" would be noise.
+        turnCount: 0,
+        totalTokens: task.totalTokens,
+        durationMs,
+        error: task.error,
+        resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+      },
+    }));
   }
 
   // Defined unconditionally, registered only when the feature is on — the same
@@ -2946,7 +2908,6 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
       }
 
       // Verbose: include full conversation
@@ -3694,9 +3655,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "joinMode",
           label: "Join mode",
-          description: "Default join mode for background agents",
-          currentValue: getDefaultJoinMode(),
-          values: ["smart", "async", "group"],
+          description: "smart = each completion at the parent's next boundary, as in Claude Code; group = one notification per turn's batch",
+          // `async` is an older name for `smart`; settings files may still hold it.
+          currentValue: getDefaultJoinMode() === "group" ? "group" : "smart",
+          values: ["smart", "group"],
         },
         {
           id: "backgroundByDefault",

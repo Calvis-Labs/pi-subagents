@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
-- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and smart group join (consolidated notifications)
+- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and completion notifications that reach the parent at its next boundary, several at once when they finish together
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). In pi's fullscreen mode it is a borderless, full-terminal observer with mouse support. Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Press `b` on a running foreground `Agent` call to hand that run to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)). Stop a still-running agent by pressing `x` (then `x` again to confirm) — steer and stop both work for background agents too. Assistant text renders as Markdown; `m` cycles that between off, assistant-only and everything (see [Viewer markdown](#persistent-settings))
@@ -611,15 +611,14 @@ Sending a foreground agent to the background moves its slot: it gives up the for
 
 ## Join Strategies
 
-When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and starts a turn when the parent is idle. The **join mode** controls how these notifications are delivered. It applies only to background agents.
+When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and everything that finished during that batch arrives as one message. An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window. If you interrupt the parent (Esc), what was waiting is handed to your next prompt instead of starting a turn. The **join mode** decides whether a result waits for its siblings. It applies only to background agents.
 
 | Mode | Behavior |
 |------|----------|
-| `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
-| `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
-| `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
+| `smart` (default) | No waiting: each result is delivered at the parent's next boundary, as in Claude Code. `async` is accepted as an older name for it. |
+| `group` | The background agents spawned in one parent turn report together, in one notification once all of them have finished. Fewer parent turns, at the cost of an early result waiting for the slowest sibling. |
 
-**Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
+**Timeout behavior (`group`):** a 30-second timeout starts after the first agent of a group completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
@@ -991,7 +990,8 @@ src/
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
-  group-join.ts       # Group join manager: batched completion notifications with timeout
+  completion-outbox.ts # Deliver completion notifications at the parent's next boundary, coalesced
+  group-join.ts       # `group` join mode: one notification per turn's batch, with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
 

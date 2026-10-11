@@ -105,7 +105,7 @@ Two asymmetries to know about, stated as they are:
 - **Stop takes an id only** (`src/index.ts:806`). Consume takes an id *or* an `@handle`, through `resolveAgentRef` (`src/index.ts:816` → `:731-736`).
 - **Consume checks `parentAgentId` but not `workflowId`** (`src/index.ts:816`). A workflow-owned agent's result can be marked consumed over the bus even though the same agent cannot be stopped.
 
-The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:573`, `:615`, `:631`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
+The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:558`, `:600`, `:616`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
 
 ## The notification race
 
@@ -113,21 +113,21 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 
 **When you send it decides whether it works.** The timeline:
 
-1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
-2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
+1. The agent settles and `subagents:completed` is emitted — `src/index.ts:566`.
+2. Eleven lines later, at `src/index.ts:577`, the code checks `record.resultConsumed` and decides whether to notify at all.
 3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
 
 | When you consume | What happens |
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The notification has been queued with `triggerTurn: true` and costs the parent a model call |
+| After an `await`, before the notification is sent | Still suppressed. The notification is built only when it is sent (`src/completion-outbox.ts:91`), and a consumed result builds nothing. It is sent about 200 ms after the completion when the parent is idle (`NOTIFICATION_HOLD_MS`), and at the end of the parent's current tool batch when it is busy |
+| After it was sent | Too late. pi has queued it with `triggerTurn: true`, and it costs the parent a model call |
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 
-Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:905`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1199`) because the record is starting a new run.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:570`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
 
 ## The manager registry
 
