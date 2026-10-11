@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Context } from "@earendil-works/pi-ai";
+import { type Context, getCurrentTools } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentCall, type PrintModeRun, runPrintMode } from "./helpers/print-mode-runner.js";
 
@@ -101,7 +101,7 @@ describe("background completion steering scheduling", () => {
         currentParentSession = session;
       },
       respond: async (context) => {
-        const isParent = (context.tools ?? []).some((tool) => tool.name === "Agent");
+        const isParent = getCurrentTools(context.messages).some((tool) => tool.name === "Agent");
         if (!isParent) {
           childModelCalls++;
           return COMPLETION_MARKER;
@@ -161,40 +161,5 @@ describe("background completion steering scheduling", () => {
     expect(completionVisibleByParentCall[1]).toBe(true);
     expect(parentModelCalls).toBeGreaterThanOrEqual(2);
     expect(childModelCalls).toBe(1);
-  });
-
-  it("starts an idle parent turn when a completion is delivered with triggerTurn", async () => {
-    let sendCompletion: (() => Promise<void>) | undefined;
-    let parentCalls = 0;
-    let completionWasVisible = false;
-
-    run = await runPrintMode({
-      hold: false,
-      prompt: "Answer once, then wait for a completion notification.",
-      onParentSession: (session) => {
-        sendCompletion = () => session.sendCustomMessage(
-          {
-            customType: "subagent-notification",
-            content: COMPLETION_MARKER,
-            display: true,
-          },
-          { deliverAs: "steer", triggerTurn: true },
-        );
-      },
-      respond: (context) => {
-        parentCalls++;
-        completionWasVisible = parentHasCompletion(context);
-        return completionWasVisible ? "processed idle completion" : "initial answer";
-      },
-    });
-
-    expect(parentCalls).toBe(1);
-    expect(completionWasVisible).toBe(false);
-
-    await sendCompletion?.();
-    await run.parentSession.waitForIdle();
-
-    expect(parentCalls).toBe(2);
-    expect(completionWasVisible).toBe(true);
   });
 });

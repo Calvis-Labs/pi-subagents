@@ -34,6 +34,9 @@ function makePi() {
         tools.set(tool.name, tool);
       }),
       registerCommand: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn(),
       on: vi.fn((event: string, handler: (...args: never[]) => unknown) => {
         handlers.set(event, handler);
       }),
@@ -129,7 +132,13 @@ describe("background completion notification wiring", () => {
 
   it("requests steering for a grouped completion after the result-consumption hold", async () => {
     vi.useFakeTimers();
-    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    // Both runs settle after their spawns return, as real runs do.
+    let settleRuns!: () => void;
+    const runsSettled = new Promise<void>((resolve) => { settleRuns = resolve; });
+    vi.mocked(runAgent).mockImplementation(async () => {
+      await runsSettled;
+      return completedRun();
+    });
 
     const { pi, tools, handlers } = makePi();
     subagentsExtension(pi);
@@ -139,6 +148,7 @@ describe("background completion notification wiring", () => {
       spawnBackground(agentTool, "group-call-1", "first grouped child"),
       spawnBackground(agentTool, "group-call-2", "second grouped child"),
     ]);
+    settleRuns();
     await vi.advanceTimersByTimeAsync(300); // 100ms smart-batch debounce + 200ms group hold
 
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
