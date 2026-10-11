@@ -2796,11 +2796,10 @@ describe("agent-runner turn limits", () => {
 // nothing checked that the signal actually reaches the session, so a child could
 // be marked stopped while it keeps running and burning tokens.
 describe("agent-runner abort signal forwarding", () => {
-  // A signal that fired BEFORE the child session existed. `addEventListener`
-  // never fires on an already-aborted signal, so without an explicit check the
-  // child is prompted and runs to completion while its parent is long gone.
-  // AgentManager.spawn guards this at its own layer; nothing guarded it here.
-  it("aborts before prompting when the signal fired before session creation", async () => {
+  // A signal that fired BEFORE the child was prompted. `addEventListener` never
+  // fires on an already-aborted signal, and pi's `session.abort()` is a no-op
+  // until a run is active — so the only way to honor it is not to prompt.
+  it("does not prompt when the signal fired before session creation", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     const controller = new AbortController();
     controller.abort();
@@ -2809,23 +2808,17 @@ describe("agent-runner abort signal forwarding", () => {
 
     await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
 
-    expect(session.abort).toHaveBeenCalledTimes(1);
-    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(
-      session.prompt.mock.invocationCallOrder[0],
-    );
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
-  it("resumeAgent aborts immediately when its signal is already aborted", async () => {
+  it("resumeAgent does not prompt when its signal is already aborted", async () => {
     const controller = new AbortController();
     controller.abort();
     const { session } = createSession("SHOULD NOT RUN");
 
     await resumeAgent(session as any, "continue", { signal: controller.signal });
 
-    expect(session.abort).toHaveBeenCalledTimes(1);
-    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(
-      session.prompt.mock.invocationCallOrder[0],
-    );
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
   it("aborts the session when the parent signal fires mid-run", async () => {
