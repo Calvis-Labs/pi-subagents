@@ -611,7 +611,7 @@ Sending a foreground agent to the background moves its slot: it gives up the for
 
 ## Join Strategies
 
-When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and everything that finished during that batch arrives as one message. An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window. If you interrupt the parent (Esc), what was waiting is handed to your next prompt instead of starting a turn. The **join mode** decides whether a result waits for its siblings. It applies only to background agents.
+When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and everything that finished during that batch arrives as one message. An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window. If you interrupt the parent (Esc), what was waiting is kept and delivered once the interrupted turn has stopped, starting a turn — as Claude Code does. The **join mode** decides whether a result waits for its siblings. It applies only to background agents.
 
 | Mode | Behavior |
 |------|----------|

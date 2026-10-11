@@ -35,10 +35,7 @@ describe("CompletionOutbox", () => {
       expect(send).not.toHaveBeenCalled();
 
       vi.advanceTimersByTime(1);
-      expect(send).toHaveBeenCalledExactlyOnceWith(
-        { content: "<done a>", details: details("a") },
-        { deliverAs: "steer", triggerTurn: true },
-      );
+      expect(send).toHaveBeenCalledExactlyOnceWith({ content: "<done a>", details: details("a") });
     });
 
     it("folds a completion inside the hold into the same message, without pushing the first back", () => {
@@ -66,14 +63,17 @@ describe("CompletionOutbox", () => {
         expect.objectContaining({
           details: expect.objectContaining({ id: "a", others: [details("b")] }),
         }),
-        { deliverAs: "steer", triggerTurn: true },
       );
     });
 
-    it("hands an aborted turn's completions to the next prompt instead of forcing a turn", () => {
+    it("holds an aborted turn's completions until the run has ended, then sends them", () => {
       outbox.add(item("a"));
       outbox.onTurnEnd("aborted");
-      expect(send).toHaveBeenCalledExactlyOnceWith(expect.anything(), { deliverAs: "nextTurn" });
+      expect(send).not.toHaveBeenCalled();
+
+      outbox.onAgentEnd();
+      vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
+      expect(send).toHaveBeenCalledOnce();
     });
 
     it("keeps completions through a failed turn, which pi may retry", () => {
@@ -89,7 +89,7 @@ describe("CompletionOutbox", () => {
       outbox.add(item("a"));
       outbox.onAgentEnd();
       vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
-      expect(send).toHaveBeenCalledExactlyOnceWith(expect.anything(), { deliverAs: "steer", triggerTurn: true });
+      expect(send).toHaveBeenCalledOnce();
     });
   });
 

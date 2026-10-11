@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Background completions that finish together reach the parent as one message, and none waits for its siblings, as in Claude Code** ([#388](https://github.com/tintinweb/pi-subagents/pull/388)). A busy parent gets everything that finished during its tool batch in one message before its next model call; an idle parent gets a turn about 200 ms after a completion, with anything else that finished in that window. The default `smart` join mode no longer holds a finished agent for up to 30 s until its siblings finish (`async` now means the same as `smart`). `group` batches by parent turn instead of a 100 ms spawn window, so worktree agents group reliably. A completion pending when you press Esc is no longer dropped: it is delivered once the interrupted turn stops, starting a turn, as Claude Code does. `get_subagent_result` now suppresses a notification any time before it is sent, not only within 200 ms.
+
 ## [0.21.0] - 2026-10-12
 
 > **⚠️ Possibly breaking — four fixes below change what an existing setup does:**

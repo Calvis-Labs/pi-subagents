@@ -131,7 +131,7 @@ describe("completion delivery to a running parent", () => {
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("passes an aborted turn's completion to the next prompt without forcing a turn", async () => {
+  it("delivers an aborted turn's completion once the run ends, starting a turn, as Claude Code does after Esc", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
     const b = await boot();
@@ -140,7 +140,16 @@ describe("completion delivery to a running parent", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     turnEnd(b, "aborted");
-    expect(b.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.anything(), { deliverAs: "nextTurn" });
+    // Sent now, it would land in the queue pi clears on Esc.
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+
+    b.parent.running = false;
+    b.lifecycle.get("agent_end")({ type: "agent_end", messages: [] });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(b.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ content: expect.stringContaining("alpha done") }),
+      { deliverAs: "steer", triggerTurn: true },
+    );
   });
 });
 

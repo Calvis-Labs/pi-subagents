@@ -12,8 +12,10 @@
  *   before it reads the steering queue.
  * - Parent idle: sent after a short hold, so near-simultaneous completions
  *   share a turn and `get_subagent_result` still gets a moment to consume one.
- * - Parent turn aborted (Esc): delivered with the user's next prompt instead of
- *   forcing a turn the user just interrupted.
+ * - Parent turn aborted (Esc) or failed: held through it — pi clears its own
+ *   queues on Esc — and sent once the run has ended, starting a turn. Claude
+ *   Code keeps an agent's completion queued through Esc the same way and runs
+ *   it as soon as the interrupted turn stops.
  */
 
 import type { NotificationDetails } from "./types.js";
@@ -32,18 +34,13 @@ export interface OutboxMessage {
  */
 export type OutboxItem = () => OutboxMessage | undefined;
 
-export type OutboxDelivery =
-  | { deliverAs: "steer"; triggerTurn: true }
-  | { deliverAs: "nextTurn" };
-
-const STEER: OutboxDelivery = { deliverAs: "steer", triggerTurn: true };
-
 export class CompletionOutbox {
   private items: OutboxItem[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
-    private send: (message: OutboxMessage, delivery: OutboxDelivery) => void,
+    /** Delivers one message as a steer that triggers a turn when the parent is idle. */
+    private send: (message: OutboxMessage) => void,
     /** Whether the parent has a run in flight, so a `turn_end` is coming. */
     private parentRunning: () => boolean,
   ) {}
@@ -55,10 +52,10 @@ export class CompletionOutbox {
 
   /** The parent finished a turn: its tool batch is done, the next model call is not. */
   onTurnEnd(stopReason: string | undefined): void {
-    if (stopReason === "aborted") this.flush({ deliverAs: "nextTurn" });
-    // pi may retry a failed turn; anything held goes with the next boundary,
-    // or with the run's end if there is none.
-    else if (stopReason !== "error") this.flush(STEER);
+    // An aborted turn ends its run; a failed one may be retried. Either way
+    // what is held waits for the next boundary or the run's end — sent now,
+    // it would sit in a queue pi is about to clear.
+    if (stopReason !== "aborted" && stopReason !== "error") this.flush();
   }
 
   /** Completions that landed after the run's last `turn_end` would otherwise wait for the next run. */
@@ -76,11 +73,11 @@ export class CompletionOutbox {
   private arm(): void {
     this.timer ??= setTimeout(() => {
       this.timer = undefined;
-      this.flush(STEER);
+      this.flush();
     }, NOTIFICATION_HOLD_MS);
   }
 
-  private flush(delivery: OutboxDelivery): void {
+  private flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const items = this.items;
@@ -95,7 +92,7 @@ export class CompletionOutbox {
     if (messages.length === 0) return;
     // A send from a timer can outlive the session it was meant for (pi -p
     // tearing down): pi throws on the stale context, and nothing is left to tell.
-    try { this.send(combine(messages), delivery); } catch { /* stale context */ }
+    try { this.send(combine(messages)); } catch { /* stale context */ }
   }
 }
 

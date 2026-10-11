@@ -455,12 +455,12 @@ export default function (pi: ExtensionAPI) {
   // completion-outbox.ts). Items are built at send time, so a result consumed
   // by get_subagent_result before then is never delivered.
   const outbox = new CompletionOutbox(
-    (message, delivery) => pi.sendMessage<NotificationDetails>({
+    (message) => pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
       content: message.content,
       display: true,
       details: message.details,
-    }, delivery),
+    }, { deliverAs: "steer", triggerTurn: true }),
     () => currentCtx?.signal !== undefined,
   );
   // A queued result wait must observe completion before its held notification
