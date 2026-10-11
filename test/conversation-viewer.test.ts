@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRecord } from "../src/types.js";
+import type { ViewerBackgroundAction } from "../src/ui/conversation-viewer.js";
 
 // ── Mock wrapTextWithAnsi ──────────────────────────────────────────────
 // We need to control what wrapTextWithAnsi returns to simulate the
@@ -823,56 +824,52 @@ describe("ConversationViewer", () => {
   describe("background key", () => {
     const W = 80;
 
-    /** `b` is offered only for a run a caller is blocking on inline. */
-    const backgroundViewer = (record: AgentRecord, onBackground?: () => void, width = W) =>
+    const backgroundViewer = (record: AgentRecord, action?: ViewerBackgroundAction, width = W) =>
       new ConversationViewer(
         mockTui(30, width), mockSession([]), record, undefined, ansiTheme(),
-        vi.fn(), vi.fn(), undefined, vi.fn(), false, undefined, undefined, onBackground,
+        vi.fn(), vi.fn(), undefined, vi.fn(), false, undefined, undefined, "auto", action,
       );
 
-    it("offers b for a live blocking run and fires once", () => {
-      const record = mockRecord({ status: "running", isBackground: false, blocking: true });
-      // The manager clears `blocking` on a successful handoff; mirror that so
-      // the affordance's own disappearance is what stops the second press.
-      const onBackground = vi.fn(() => { record.blocking = false; record.isBackground = true; });
-      const viewer = backgroundViewer(record, onBackground);
+    /** An action available until it is sent, as the extension's is. */
+    const oneShotAction = () => {
+      let available = true;
+      const send = vi.fn(() => { available = false; });
+      return { available: () => available, send };
+    };
+
+    it("offers b while the owner says the run can be handed off, and sends once", () => {
+      const action = oneShotAction();
+      const viewer = backgroundViewer(mockRecord({ status: "running" }), action);
 
       expect(viewer.render(W).join("\n")).toContain("b bg");
       viewer.handleInput("b");
-      expect(onBackground).toHaveBeenCalledTimes(1);
+      expect(action.send).toHaveBeenCalledTimes(1);
 
       expect(viewer.render(W).join("\n")).not.toContain("b bg");
       viewer.handleInput("b");
-      expect(onBackground).toHaveBeenCalledTimes(1);
+      expect(action.send).toHaveBeenCalledTimes(1);
     });
 
-    it("hides and ignores b wherever the manager would refuse it", () => {
-      // Each of these is "running and/or foreground-looking" but not something
-      // `sendToBackground` accepts — an affordance here would be a dead key.
-      for (const overrides of [
-        { status: "running" as const, isBackground: true, blocking: false },   // already background
-        { status: "running" as const, isBackground: false },                   // resume / detached: no waiter
-        { status: "queued" as const, blocking: true },                         // no session yet
-        { status: "completed" as const, blocking: true },                      // already settled
-      ]) {
-        const onBackground = vi.fn();
-        const viewer = backgroundViewer(mockRecord(overrides), onBackground);
-        expect(viewer.render(W).join("\n")).not.toContain("b bg");
-        viewer.handleInput("b");
-        expect(onBackground).not.toHaveBeenCalled();
-      }
+    it("hides and ignores b when the owner says it is unavailable", () => {
+      // The record alone cannot say: a blocking, running agent-generator spawn
+      // has no tool call to release. Only the owner's answer counts.
+      const send = vi.fn();
+      const viewer = backgroundViewer(
+        mockRecord({ status: "running", blocking: true }), { available: () => false, send },
+      );
+      expect(viewer.render(W).join("\n")).not.toContain("b bg");
+      viewer.handleInput("b");
+      expect(send).not.toHaveBeenCalled();
     });
 
-    it("omits b entirely when no handler is supplied", () => {
+    it("omits b entirely when no action is supplied", () => {
       const viewer = backgroundViewer(mockRecord({ status: "running", blocking: true }), undefined);
       expect(viewer.render(W).join("\n")).not.toContain("b bg");
       expect(() => viewer.handleInput("b")).not.toThrow();
     });
 
     it("keeps the footer within width at 80 columns with every action showing", () => {
-      const viewer = backgroundViewer(
-        mockRecord({ status: "running", blocking: true }), vi.fn(), 80,
-      );
+      const viewer = backgroundViewer(mockRecord({ status: "running" }), oneShotAction(), 80);
       const lines = viewer.render(80);
       const footer = lines.find(l => l.includes("b bg"));
       expect(footer).toBeDefined();

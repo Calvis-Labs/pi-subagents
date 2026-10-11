@@ -153,6 +153,9 @@ export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
   | { kind: "tombstone"; entry: AgentTombstone };
 
+/** Which concurrency pool a run is charged to. */
+export type Pool = "background" | "foreground";
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -187,11 +190,21 @@ export interface AgentRecord {
    * cross-extension RPC spawn is foreground by that measure and yet blocks
    * nobody, so it takes no slot.
    *
-   * Cleared by `sendToBackground`, which is exactly the moment that inline
-   * caller stops waiting. It is also what the `b` affordance keys off, so the
-   * key disappears the instant the handoff lands.
+   * Cleared when the inline caller stops waiting: by `sendToBackground`, or
+   * when the run settles.
    */
   blocking?: boolean;
+  /**
+   * The concurrency pool this run's slot is charged to, set once when it
+   * starts. `settleRun` releases exactly this; `sendToBackground` is the only
+   * thing that moves it, together with the counters.
+   */
+  chargedPool?: Pool;
+  /**
+   * Removes the listener that stops this run when its caller's signal aborts.
+   * At most one is armed at a time — queueing arms one, starting replaces it.
+   */
+  detachParentAbort?: () => void;
   /**
    * Present only while the record is "queued": resolves when it leaves the
    * queue, started or aborted. `spawnAndWait` waits on this because a queued

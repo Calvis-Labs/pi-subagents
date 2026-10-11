@@ -1,17 +1,20 @@
 // sendToBackground — handing a LIVE blocking run to the background without
-// restarting it (the `b` key in the conversation viewer).
+// restarting it (ctrl+b at the prompt, `b` in the conversation viewer).
 //
-// The invariant under test is that nothing about the run changes except who is
-// waiting for it: same session, same promise, same abort controller, same
+// The invariant under test is that nothing about the run changes except who
+// answers for it: same session, same promise, same abort controller, same
 // in-flight turn. What DOES change is accounting — the run stops being charged
 // to whatever pool a blocking spawn occupies and starts being charged to the
 // background one — and ownership: the tool call that armed the parent-abort
-// listeners no longer owns the agent, so its Esc must not reach it.
+// listener no longer owns the agent, so its Esc must not reach it.
 //
-// The dangerous failures here are hangs and counter leaks, not wrong text. A
-// waiter that never resolves blocks a tool `execute` forever (pi has no
-// tool-execution timeout), and a slot released twice or never silently lifts or
-// permanently lowers a concurrency limit. Both are asserted directly.
+// Releasing the blocked caller is the Agent tool's job (it races its own
+// wake-up against `spawnAndWait`), so here `spawnAndWait` keeps waiting until
+// the run really settles — and then settles it as a background run.
+//
+// The dangerous failures here are counter leaks, not wrong text: a slot
+// released twice or never silently lifts or permanently lowers a concurrency
+// limit. Those are asserted directly.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
@@ -23,8 +26,8 @@ vi.mock("../src/agent-runner.js", () => ({
 
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(),
+  cleanupWorktree: vi.fn(async () => ({ hasChanges: false })),
+  pruneWorktrees: vi.fn(async () => {}),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
@@ -37,12 +40,10 @@ const mockSession = () => ({ dispose: vi.fn() }) as any;
 /** Runs that settle only when their returned resolver is called, keyed by prompt. */
 function controllableRuns() {
   const resolvers = new Map<string, (aborted?: boolean) => void>();
-  const sessions = new Map<string, any>();
   vi.mocked(runAgent).mockClear();
   vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, prompt: any, options: any) =>
     new Promise<any>(resolve => {
       const session = mockSession();
-      sessions.set(prompt as string, session);
       options.onSessionCreated?.(session);
       resolvers.set(prompt as string, (aborted = false) => resolve({
         responseText: `${prompt}-result`,
@@ -52,7 +53,7 @@ function controllableRuns() {
       }));
     }),
   );
-  return { resolvers, sessions };
+  return { resolvers };
 }
 
 /** Let queued microtasks (gate resolution, settle handlers) run. */
@@ -88,36 +89,29 @@ describe("AgentManager.sendToBackground", () => {
     await manager?.dispose();
   });
 
-  it("returns the blocked caller while the same run keeps going", async () => {
+  it("keeps the same run going and settles it as a background run", async () => {
     const { resolvers } = controllableRuns();
     manager = new AgentManager(onComplete);
 
-    let settled = false;
-    const waiting = fg(manager, "live").then(r => { settled = true; return r; });
+    const waiting = fg(manager, "live");
     await flush();
 
     const record = recordFor(manager, "live");
     const { promise, session, abortController } = record;
 
-    expect(settled).toBe(false);
     expect(manager.sendToBackground(record.id)).toBe(true);
-
-    const { record: returned } = await waiting;
-    expect(settled).toBe(true);
-    // Nothing about the RUN changed — only who is waiting on it.
-    expect(returned).toBe(record);
+    // Nothing about the RUN changed — only who answers for it.
     expect(record.status).toBe("running");
     expect(record.promise).toBe(promise);
     expect(record.session).toBe(session);
     expect(record.abortController).toBe(abortController);
     expect(abortController?.signal.aborted).toBe(false);
-    // ...and the record now describes a background agent.
     expect(record.isBackground).toBe(true);
     expect(record.blocking).toBe(false);
     expect(onComplete).not.toHaveBeenCalled();
 
     resolvers.get("live")!();
-    await flush();
+    await waiting;
     expect(record.status).toBe("completed");
     expect(record.result).toBe("live-result");
     // resultConsumed false = the completion notification is NOT suppressed, so
@@ -127,7 +121,7 @@ describe("AgentManager.sendToBackground", () => {
   });
 
   it("takes the parent's Esc off a run it no longer owns", async () => {
-    controllableRuns();
+    const { resolvers } = controllableRuns();
     manager = new AgentManager(onComplete);
     const parent = new AbortController();
 
@@ -136,17 +130,18 @@ describe("AgentManager.sendToBackground", () => {
     const record = recordFor(manager, "live");
 
     expect(manager.sendToBackground(record.id)).toBe(true);
-    await waiting;
-
     parent.abort();
     expect(record.status).toBe("running");
     expect(record.abortController?.signal.aborted).toBe(false);
+
+    resolvers.get("live")!();
+    await waiting;
   });
 
   it("also takes off the listener armed while it was QUEUED", async () => {
-    // A blocking spawn that waited for a foreground slot carries TWO parent
-    // listeners: one armed at enqueue, one armed at start. Releasing only the
-    // second leaves the caller's Esc able to kill a handed-off run.
+    // A blocking spawn that waited for a foreground slot armed a parent
+    // listener at enqueue, and another at start. Leaving the first behind lets
+    // the caller's Esc kill a handed-off run.
     const { resolvers } = controllableRuns();
     manager = new AgentManager(onComplete);
     manager.setMaxConcurrentForeground(1);
@@ -165,11 +160,13 @@ describe("AgentManager.sendToBackground", () => {
     const record = recordFor(manager, "queued");
     expect(record.status).toBe("running");
     expect(manager.sendToBackground(record.id)).toBe(true);
-    await queued;
 
     parent.abort();
     expect(record.status).toBe("running");
     expect(record.abortController?.signal.aborted).toBe(false);
+
+    resolvers.get("queued")!();
+    await queued;
   });
 
   it("leaves a parent Esc BEFORE the handoff as a normal foreground stop", async () => {
@@ -200,27 +197,31 @@ describe("AgentManager.sendToBackground", () => {
   });
 
   it("is single-use", async () => {
-    controllableRuns();
-    manager = new AgentManager(onComplete);
+    const { resolvers } = controllableRuns();
+    manager = new AgentManager(onComplete, 1);
     const waiting = fg(manager, "live");
     await flush();
     const record = recordFor(manager, "live");
 
     expect(manager.sendToBackground(record.id)).toBe(true);
     expect(manager.sendToBackground(record.id)).toBe(false);
+    resolvers.get("live")!();
     await waiting;
     expect(manager.sendToBackground(record.id)).toBe(false);
+
+    // One background slot taken, one released: the pool (limit 1) is free.
+    bg(manager, "after");
+    await flush();
+    expect(recordFor(manager, "after").status).toBe("running");
   });
 
-  it("refuses a foreground RESUME, which has no inline waiter to release", async () => {
-    // The regression that makes eligibility hinge on a registered waiter rather
-    // than on `isBackground === false`. A resumed foreground agent is "running"
-    // with `isBackground: false`, but resume() awaits inline WITHOUT registering
-    // a waiter and settles WITHOUT releasing a pool slot — so handing it off
-    // would leak a background slot for the life of the process and report a
-    // handoff that never happened.
+  it("refuses a foreground RESUME, which charged no slot to move", async () => {
+    // A resumed foreground agent is "running" with `isBackground: false` and
+    // still holds its spawn's settled promise, but resume() takes no pool slot
+    // — so moving "its" slot would underflow the foreground count and charge a
+    // background slot nothing releases.
     const { resolvers } = controllableRuns();
-    manager = new AgentManager(onComplete);
+    manager = new AgentManager(onComplete, 1);
 
     const waiting = fg(manager, "reusable");
     await flush();
@@ -244,43 +245,58 @@ describe("AgentManager.sendToBackground", () => {
     await resuming;
 
     // The background pool is untouched, so a background spawn still starts.
-    manager.setMaxConcurrent(1);
     bg(manager, "after");
     await flush();
     expect(recordFor(manager, "after").status).toBe("running");
   });
 
-  it("refuses a nested child and a detached non-blocking spawn", async () => {
-    controllableRuns();
+  it("refuses runs that do not report to the session, or block nobody", async () => {
+    const { resolvers } = controllableRuns();
     manager = new AgentManager(onComplete);
 
-    const parentWait = fg(manager, "owner");
+    const ownerWait = fg(manager, "owner");
     await flush();
     const owner = recordFor(manager, "owner");
 
     // Nested children report only through their owner — never to the session.
-    manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
-      description: "child",
-      isBackground: false,
-      parentAgentId: owner.id,
-    });
-    await flush();
-    expect(manager.sendToBackground(recordFor(manager, "child").id)).toBe(false);
-
-    // Detached `isBackground: false` (RPC / @handle / registry): nobody is
-    // blocked on it, so there is nothing to hand back.
+    const childWait = fg(manager, "child", { parentAgentId: owner.id });
+    // A workflow's agents report to the script that spawned them.
+    const workflowWait = fg(manager, "workflow-child", { workflowId: "wf-1" });
+    // Detached `isBackground: false` (RPC / @handle / registry): nobody blocks on it.
     manager.spawn(mockPi, mockCtx, "general-purpose", "detached", {
       description: "detached",
       isBackground: false,
     });
+    const background = bg(manager, "background");
     await flush();
-    const detached = recordFor(manager, "detached");
-    expect(detached.status).toBe("running");
-    expect(manager.sendToBackground(detached.id)).toBe(false);
 
+    for (const prompt of ["child", "workflow-child", "detached", "background"]) {
+      expect(recordFor(manager, prompt).status).toBe("running");
+      expect(manager.sendToBackground(recordFor(manager, prompt).id)).toBe(false);
+    }
+    expect(manager.getRecord(background)?.isBackground).toBe(true);
     expect(manager.sendToBackground("no-such-agent")).toBe(false);
+
     expect(manager.sendToBackground(owner.id)).toBe(true);
-    await parentWait;
+    for (const prompt of ["owner", "child", "workflow-child", "detached", "background"]) resolvers.get(prompt)!();
+    await Promise.all([ownerWait, childWait, workflowWait]);
+  });
+
+  it("refuses a blocking spawn still waiting in the queue", async () => {
+    const { resolvers } = controllableRuns();
+    manager = new AgentManager(onComplete);
+    manager.setMaxConcurrentForeground(1);
+
+    const first = fg(manager, "holder");
+    const queued = fg(manager, "queued");
+    await flush();
+    expect(manager.sendToBackground(recordFor(manager, "queued").id)).toBe(false);
+
+    resolvers.get("holder")!();
+    await first;
+    await flush();
+    resolvers.get("queued")!();
+    await queued;
   });
 
   it("moves the run from the foreground pool to the background pool", async () => {
@@ -304,19 +320,19 @@ describe("AgentManager.sendToBackground", () => {
     expect(manager.getRecord(laterBg)?.status).toBe("queued");
 
     expect(manager.sendToBackground(record.id)).toBe(true);
-    await handedOff;
     await flush();
 
     // Foreground slot released — the queued blocking spawn drains immediately.
     expect(recordFor(manager, "next-blocking").status).toBe("running");
-    // ...and a background slot taken, so `later-bg` still cannot start even
-    // once the background agent that was running finishes.
+    // ...and a background slot taken (over the limit), so `later-bg` still
+    // cannot start once the background agent that was running finishes.
     resolvers.get("next-bg")!();
     await flush();
     expect(manager.getRecord(laterBg)?.status).toBe("queued");
 
     // Only when the handed-off run itself completes does that slot come back.
     resolvers.get("handoff")!();
+    await handedOff;
     await flush();
     expect(manager.getRecord(laterBg)?.status).toBe("running");
 
@@ -341,6 +357,7 @@ describe("AgentManager.sendToBackground", () => {
     await flush();
 
     expect(record.status).toBe("completed");
+    expect(record.resultConsumed).toBe(false);
     expect(onComplete).toHaveBeenCalledTimes(1);
 
     // The background pool (limit 1) is free again — proof the slot taken by the
@@ -348,22 +365,5 @@ describe("AgentManager.sendToBackground", () => {
     bg(manager, "after");
     await flush();
     expect(recordFor(manager, "after").status).toBe("running");
-  });
-
-  it("releases a caller blocked on a wedged run when the manager is disposed", async () => {
-    vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, _prompt: any, options: any) => {
-      options.onSessionCreated?.(mockSession());
-      return new Promise(() => {});
-    });
-    manager = new AgentManager(onComplete);
-
-    let settled = false;
-    const waiting = fg(manager, "wedged").then(r => { settled = true; return r; });
-    await flush();
-    expect(settled).toBe(false);
-
-    await manager.dispose();
-    await waiting;
-    expect(settled).toBe(true);
   });
 });
