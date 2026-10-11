@@ -190,6 +190,7 @@ describe("background completion steering scheduling", () => {
     const runPromise = runPrintMode({
       cwd,
       hold: false,
+      live: false, // scripted on purpose: the blocking tool and the timing are the test
       extensionPaths: [BLOCKING_TOOL_EXTENSION],
       prompt: "Start two background children and keep working with a blocking tool.",
       respond: async (context) => {
