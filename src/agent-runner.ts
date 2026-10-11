@@ -837,8 +837,13 @@ export async function runAgent(
       // Under `noExtensions` the static allowlist gates the registry itself.
       ...(noExtensions ? [] : [scopeGateExtension(nestedCallGate)]),
     ],
-    // Mirrors pi's CLI mapping, so `pi --no-mcp` keeps MCP out of subagents too.
-    disabledBuiltinExtensions: process.argv.includes("--no-mcp") ? ["mcp"] : undefined,
+    // Mirrors pi's CLI: `--no-mcp` keeps MCP out of subagents too, and `--no-extensions`
+    // keeps all the built-ins out. Discovered extensions still follow `extensions:`.
+    disabledBuiltinExtensions: process.argv.some((a) => a === "--no-extensions" || a === "-ne")
+      ? ["codemode", "tool-search", "mcp"]
+      : process.argv.includes("--no-mcp")
+        ? ["mcp"]
+        : undefined,
     cwd: configCwd,
     agentDir,
     noExtensions,

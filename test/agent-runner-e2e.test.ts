@@ -41,6 +41,7 @@ vi.setConfig({ testTimeout: 30_000 });
 
 const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", import.meta.url)));
 const EXPOSURE_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-exposure-ext.mjs", import.meta.url)));
+const LAZY_MCP_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-lazy-mcp-ext.mjs", import.meta.url)));
 /** The fixture registers exactly this tool. */
 const EXT_TOOL = "e2e_probe";
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -71,6 +72,8 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
    */
   /** Every tool the last session registered, active or not — set by `activeToolsFor`. */
   let registered: string[] = [];
+  /** The last session `activeToolsFor` built — set alongside `registered`. */
+  let lastSession: any;
 
   async function activeToolsFor(
     cfg: Partial<AgentConfig>,
@@ -118,6 +121,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
           registered = s.getAllTools().map((t) => t.name);
+          lastSession = s;
         },
       });
     } catch {
@@ -303,6 +307,19 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
       expect(await started(marker)).toBe(false);
     });
 
+    it("starting pi with -ne keeps every built-in out of the subagent", async () => {
+      const marker = writeMcpConfig(cwd);
+      process.argv.push("-ne");
+      try {
+        await withEmptyAgentDir(() => activeToolsFor({ extensions: true }, true));
+      } finally {
+        process.argv.pop();
+      }
+      expect(registered).not.toContain("codemode");
+      expect(registered).not.toContain("tool_search");
+      expect(await started(marker)).toBe(false);
+    });
+
     it("exclude_extensions: builtin:mcp keeps the built-in MCP out of the subagent", async () => {
       const marker = writeMcpConfig(cwd);
       await withEmptyAgentDir(() => activeToolsFor({ extensions: true, excludeExtensions: ["builtin:mcp"] }, true));
@@ -316,6 +333,33 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
       expect(registered).toContain("tool_search");
       expect(registered).not.toContain("codemode");
       expect(await started(marker)).toBe(false);
+    });
+
+    it("ext:builtin:codemode beside a narrowed MCP tool keeps codemode active, as pi's --tools does", async () => {
+      // pi's MCP activates codemode at session_start, before its server tools
+      // register. Naming the bridge, as in `pi --tools read,codemode,'mcp__*'`,
+      // keeps it in scope from the start, so the scope never takes it back.
+      const canon = extensionCanonicalName(LAZY_MCP_FIXTURE);
+      const active = await withEmptyAgentDir(() =>
+        activeToolsFor({
+          extensions: ["*", LAZY_MCP_FIXTURE],
+          extSelectors: [`ext:${canon}/mcp__lazy__lookup`, "ext:builtin:codemode"],
+        }),
+      );
+      expect(active).toContain("codemode");
+      expect(registered).not.toContain("mcp__lazy__lookup"); // the server has not connected yet
+      (globalThis as { __lazyMcpConnect?: () => void }).__lazyMcpConnect?.();
+      expect(lastSession.getAllTools().map((t: { name: string }) => t.name)).toContain("mcp__lazy__lookup");
+      expect(lastSession.getActiveToolNames()).toContain("codemode");
+      expect(lastSession.getActiveToolNames()).not.toContain("tool_search");
+    });
+
+    it("an ext: allowlist that names no bridge keeps codemode out, as pi's --tools does", async () => {
+      const canon = extensionCanonicalName(LAZY_MCP_FIXTURE);
+      const active = await withEmptyAgentDir(() =>
+        activeToolsFor({ extensions: ["*", LAZY_MCP_FIXTURE], extSelectors: [`ext:${canon}/mcp__lazy__lookup`] }),
+      );
+      expect(active).not.toContain("codemode");
     });
   });
 });
