@@ -221,6 +221,35 @@ describe("`group` join mode — one notification per turn's batch", () => {
     expect(content).not.toContain("read-early done");
   });
 
+  it("reports a turn's lone spawn as a single completion, not a group of one", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({ defaultJoinMode: "group" });
+    await spawn(b, b.parentCtx, "solo");
+    turnEnd(b);
+
+    runs.settle("solo");
+    await vi.advanceTimersByTimeAsync(1_000);
+    turnEnd(b);
+
+    expect(sentContents(b)).toEqual([expect.not.stringMatching(/^Background agent group completed/)]);
+    expect(sentContents(b)[0]).toContain("solo done");
+  });
+
+  it("reports a lone spawn that finished before its turn ended as a single completion", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({ defaultJoinMode: "group" });
+    await spawn(b, b.parentCtx, "solo");
+    runs.settle("solo");
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    turnEnd(b);
+
+    expect(sentContents(b)).toEqual([expect.not.stringMatching(/^Background agent group completed/)]);
+    expect(sentContents(b)[0]).toContain("solo done");
+  });
+
   it("delivers a spawn made outside a parent turn, which has no turn end to wait for", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();

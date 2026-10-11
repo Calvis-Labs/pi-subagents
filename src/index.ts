@@ -1306,11 +1306,16 @@ export default function (pi: ExtensionAPI) {
     if (joinMode === 'group' && currentCtx?.signal !== undefined) turnGroupSpawns.push(id);
   }
 
-  /** Register the ending turn's `group` spawns as one group. */
+  /** Register the ending turn's `group` spawns, two or more, as one group. */
   function registerTurnGroup() {
     const ids = turnGroupSpawns;
     turnGroupSpawns = [];
-    if (ids.length === 0) return;
+    // One spawn is no group: it reports like any single completion.
+    if (ids.length < 2) {
+      const record = ids.length === 1 ? manager.getRecord(ids[0]) : undefined;
+      if (record?.completedAt != null && !record.resultConsumed) sendIndividualNudge(record);
+      return;
+    }
     const groupId = `turn-${++turnGroupCounter}`;
     groupJoin.registerGroup(groupId, ids);
     // Members that finished before their turn ended had their completion
