@@ -400,9 +400,9 @@ interface ConfiguredPackageRow {
 /**
  * Build a read-only view of pi's configured packages.
  *
- * Feature-detected rather than assumed: the peer floor is `>=0.84.0` and this
- * API is not exercised by CI across that whole range, so a host that does not
- * expose it contributes no packages instead of failing activation.
+ * Feature-detected rather than assumed: the peer range `>=1.1.0` is open-ended,
+ * so a later pi that drops or renames this API contributes no packages instead
+ * of failing activation.
  */
 function configuredPackages(cwd: string, projectTrusted: boolean): ConfiguredPackageRow[] {
   try {

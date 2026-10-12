@@ -234,7 +234,6 @@ ${input.systemPrompt}
 `;
 }
 
-/** Render a built-in tool list as a `tools:` frontmatter value. */
 /**
  * Rebuild the `tools:` CSV from the two halves the loader split it into.
  *
