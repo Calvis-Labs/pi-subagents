@@ -31,11 +31,11 @@ export interface OutboxMessage {
 /**
  * A notification for one or more agents, built when they finished: a resume
  * before the send must not rewrite it. Reading an agent's result cancels its
- * id; `build` gets the ids still pending and returns `undefined` for none.
+ * id, and an item left with none is dropped; `build` gets the ids still pending.
  */
 export interface OutboxItem {
   ids: string[];
-  build(ids: readonly string[]): OutboxMessage | undefined;
+  build(ids: readonly string[]): OutboxMessage;
 }
 
 export class CompletionOutbox {
@@ -94,13 +94,7 @@ export class CompletionOutbox {
     this.timer = undefined;
     const items = this.items;
     this.items = [];
-    const messages: OutboxMessage[] = [];
-    for (const item of items) {
-      try {
-        const message = item.build(item.ids);
-        if (message) messages.push(message);
-      } catch { /* a stale completion must not take the others down */ }
-    }
+    const messages = items.map(item => item.build(item.ids));
     if (messages.length === 0) return;
     // A send from a timer can outlive the session it was meant for (pi -p
     // tearing down): pi throws on the stale context, and nothing is left to tell.

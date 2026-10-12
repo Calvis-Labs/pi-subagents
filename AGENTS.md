@@ -37,6 +37,8 @@ Read the file that covers a surface before changing its behavior; update it in t
 
 `README.md` holds the reference tables and links out; `docs/` holds the long-form guides. Each guide states its audience in its first three lines — read that before deciding it is the wrong file. Renaming an event, an RPC channel, a reply-envelope field, or a workflow global is a docs change too.
 
+Cite code by symbol or quoted string (`spawnTopLevel` in `src/index.ts`), never by line number: line numbers go stale on any edit above them.
+
 ## Commands
 
 - After code changes (not docs), run the full check suite and fix all errors and warnings:

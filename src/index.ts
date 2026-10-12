@@ -499,15 +499,13 @@ export default function (pi: ExtensionAPI) {
           ids: members.map(m => m.id),
           build: (ids) => {
             const unread = members.filter(m => ids.includes(m.id));
-            if (unread.length === 0) return undefined;
-
             const notifications = unread.map(m => m.text).join('\n\n');
             const label = partial
               ? `${unread.length} agent(s) finished (partial — others still running)`
               : `${unread.length} agent(s) finished`;
 
             const [first, ...rest] = unread;
-            const details = { ...first.details };
+            const details = first.details;
             if (rest.length > 0) details.others = rest.map(m => m.details);
             return {
               content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
