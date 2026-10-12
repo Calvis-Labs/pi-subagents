@@ -12,7 +12,9 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAgentConfig, getAllTypes } from "../src/agent-types.js";
+import subagentsExtension from "../src/index.js";
 import { packageNameForPath, resetPackageState } from "../src/package-resources.js";
+import { listSavedWorkflows, readSavedWorkflow } from "../src/workflow/saved.js";
 import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
 const AGENT = "---\nname: pkg-researcher\ndescription: From a package\ntools: read, grep\n---\nYou research.\n";
@@ -90,8 +92,7 @@ describe("package-provided agents, wired through the extension", () => {
   /** Activate the extension, without starting a session. */
   async function activate(): Promise<void> {
     booted = makePi();
-    const factory = (await import("../src/index.js")).default;
-    factory(booted.pi);
+    subagentsExtension(booted.pi);
   }
 
   /** Activate the extension and run its `session_start` handler. */
@@ -220,7 +221,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makePackage()]);
 
       await boot(false);
-      const { listSavedWorkflows, readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(listSavedWorkflows(env.dir)).toContain("pkg-flow");
       expect(readSavedWorkflow("pkg-flow", env.dir).ok).toBe(true);
     });
@@ -230,7 +230,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makePackage()]);
 
       await boot(false);
-      const { listSavedWorkflows, readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(listSavedWorkflows(env.dir)).not.toContain("pkg-flow");
       expect(readSavedWorkflow("pkg-flow", env.dir).ok).toBe(false);
     });
@@ -240,7 +239,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makePackage()]);
 
       await boot(false);
-      const { listSavedWorkflows } = await import("../src/workflow/saved.js");
       expect(getAllTypes()).toContain("pkg-researcher");
       expect(listSavedWorkflows(env.dir)).not.toContain("pkg-flow");
     });
@@ -264,7 +262,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makeExcludingPackage()]);
 
       await boot(false);
-      const { listSavedWorkflows, readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(listSavedWorkflows(env.dir)).toContain("pkg-flow");
       expect(listSavedWorkflows(env.dir)).not.toContain("wip-flow");
       expect(readSavedWorkflow("wip-flow", env.dir).ok).toBe(false);
@@ -277,7 +274,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makeExcludingPackage(), makePackage("other-subagents")]);
 
       await boot(false);
-      const { listSavedWorkflows } = await import("../src/workflow/saved.js");
       expect(listSavedWorkflows(env.dir)).toContain("pkg-flow");
       expect(getAllTypes()).toContain("pkg-researcher");
     });
@@ -307,8 +303,19 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makeFileDeclaringPackage()]);
 
       await boot(false);
-      const { readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(readSavedWorkflow("declared", env.dir).ok).toBe(true);
+    });
+
+    it("refuses a declared file with no meta declaration, rather than running it", async () => {
+      env = hermeticDir();
+      const root = makeFileDeclaringPackage();
+      writeFileSync(join(root, "declared.js"), "return 'not a workflow'\n");
+      writePiSettings("user", [root]);
+
+      await boot(false);
+      const found = readSavedWorkflow("declared", env.dir);
+      expect(found.ok).toBe(false);
+      expect(found.ok ? "" : found.message).toContain("is not a workflow script");
     });
 
     it("leaves the undeclared sibling unreachable", async () => {
@@ -316,7 +323,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makeFileDeclaringPackage()]);
 
       await boot(false);
-      const { listSavedWorkflows, readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(listSavedWorkflows(env.dir)).toEqual(["declared"]);
       expect(readSavedWorkflow("internal", env.dir).ok).toBe(false);
     });
@@ -331,7 +337,6 @@ describe("package-provided agents, wired through the extension", () => {
       );
 
       await boot(false);
-      const { readSavedWorkflow } = await import("../src/workflow/saved.js");
       const found = readSavedWorkflow("declared", env.dir);
       expect(found.ok && found.path).toBe(join(env.dir, ".pi", "workflows", "declared.js"));
     });
@@ -341,7 +346,6 @@ describe("package-provided agents, wired through the extension", () => {
       writePiSettings("user", [makeFileDeclaringPackage()]);
 
       await boot(false);
-      const { readSavedWorkflow } = await import("../src/workflow/saved.js");
       expect(readSavedWorkflow("declared", env.dir).ok).toBe(false);
     });
   });
@@ -438,7 +442,6 @@ describe("package-provided agents, wired through the extension", () => {
     writePiSettings("user", [makePackage()]);
 
     await boot(false);
-    const { getAgentConfig } = await import("../src/agent-types.js");
     expect(getAgentConfig("pkg-researcher")?.source).toBe("project");
     expect(getAgentConfig("pkg-researcher")?.description).toBe("Mine");
   });
