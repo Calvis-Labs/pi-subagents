@@ -452,8 +452,8 @@ export default function (pi: ExtensionAPI) {
   // ---- Completion delivery ----
   // Every completion notification goes through the outbox, which sends what is
   // pending as one message at the parent's next boundary (see
-  // completion-outbox.ts). Items are built at send time, so a result consumed
-  // by get_subagent_result before then is never delivered.
+  // completion-outbox.ts). Each is built when the agent finishes, and reading
+  // the result (get_subagent_result, rpc consume) cancels it before it is sent.
   const outbox = new CompletionOutbox(
     (message) => pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
@@ -471,14 +471,16 @@ export default function (pi: ExtensionAPI) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    outbox.add(() => {
-      if (record.resultConsumed) return undefined;
+    // Built now, so a resume before the send cannot rewrite it. A record that
+    // cannot be formatted is skipped, as a failed send always was.
+    try {
       const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-      return {
+      const message = {
         content: formatTaskNotification(record, 500, showCost) + footer,
         details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
       };
-    });
+      outbox.add({ ids: [record.id], build: () => message });
+    } catch { /* ignore stale completion side-effect errors */ }
     widget.update();
   }
 
@@ -487,25 +489,33 @@ export default function (pi: ExtensionAPI) {
     (records, partial) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
-      outbox.add(() => {
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) return undefined;
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-        return {
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          details,
-        };
+      const members = records.filter(r => !r.resultConsumed).flatMap(r => {
+        try {
+          return [{ id: r.id, text: formatTaskNotification(r, 300, showCost), details: buildNotificationDetails(r, 300, agentActivity.get(r.id)) }];
+        } catch { return []; /* as in sendIndividualNudge */ }
       });
+      if (members.length > 0) {
+        outbox.add({
+          ids: members.map(m => m.id),
+          build: (ids) => {
+            const unread = members.filter(m => ids.includes(m.id));
+            if (unread.length === 0) return undefined;
+
+            const notifications = unread.map(m => m.text).join('\n\n');
+            const label = partial
+              ? `${unread.length} agent(s) finished (partial — others still running)`
+              : `${unread.length} agent(s) finished`;
+
+            const [first, ...rest] = unread;
+            const details = { ...first.details };
+            if (rest.length > 0) details.others = rest.map(m => m.details);
+            return {
+              content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+              details,
+            };
+          },
+        });
+      }
       widget.update();
     },
     30_000,
@@ -802,6 +812,7 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             record.resultConsumed = true;
+            outbox.cancel(record.id);
             return true;
           },
         },
@@ -2496,8 +2507,7 @@ Terse command-style prompts produce shallow, generic work.
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
-    const durationMs = elapsedMs(task, Date.now());
-    outbox.add(() => ({
+    const message = {
       content: formatWorkflowNotification(task),
       details: {
         id: task.id,
@@ -2507,11 +2517,12 @@ Terse command-style prompts produce shallow, generic work.
         // A workflow has agents, not turns; rendering "↻0" would be noise.
         turnCount: 0,
         totalTokens: task.totalTokens,
-        durationMs,
+        durationMs: elapsedMs(task, Date.now()),
         error: task.error,
         resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
       },
-    }));
+    };
+    outbox.add({ ids: [task.id], build: () => message });
   }
 
   // Defined unconditionally, registered only when the feature is on — the same
@@ -2913,6 +2924,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
+        outbox.cancel(record.id);
       }
 
       // Verbose: include full conversation

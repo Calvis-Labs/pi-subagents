@@ -9,7 +9,7 @@ import type * as WorktreeModule from "../src/worktree.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof AgentRunnerModule>("../src/agent-runner.js");
-  return { ...actual, runAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
 vi.mock("../src/worktree.js", async () => {
@@ -22,7 +22,7 @@ vi.mock("../src/worktree.js", async () => {
   };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { createWorktree } from "../src/worktree.js";
 import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
@@ -39,6 +39,7 @@ afterEach(async () => {
   hermetic?.restore();
   hermetic = undefined;
   vi.mocked(runAgent).mockReset();
+  vi.mocked(resumeAgent).mockReset();
   vi.mocked(createWorktree).mockReset();
   vi.useRealTimers();
 });
@@ -62,9 +63,12 @@ function controllableRuns() {
   vi.mocked(runAgent).mockImplementation((_c: any, _t: any, prompt: any) =>
     new Promise<any>(resolve => {
       finishers.set(prompt, () => resolve({
-        responseText: `${prompt} done`, session: { dispose: vi.fn() }, aborted: false, steered: false,
+        responseText: `${prompt} done`, session: { dispose: vi.fn(), messages: [] }, aborted: false, steered: false,
       }));
     }) as any,
+  );
+  vi.mocked(resumeAgent).mockImplementation((_s: any, prompt: string) =>
+    new Promise(resolve => { finishers.set(prompt, () => resolve({ text: `${prompt} done` })); }),
   );
   return { settle: (prompt: string) => finishers.get(prompt)!() };
 }
@@ -150,6 +154,82 @@ describe("completion delivery to a running parent", () => {
       expect.objectContaining({ content: expect.stringContaining("alpha done") }),
       { deliverAs: "steer", triggerTurn: true },
     );
+  });
+  it("drops a completion whose result another extension consumed over RPC before the boundary", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const [, consume] = b.pi.events.on.mock.calls.find(([channel]: any[]) => channel === "subagents:rpc:consume");
+    await consume({ requestId: "r1", agentId: id });
+    turnEnd(b);
+
+    expect(b.pi.events.emit).toHaveBeenCalledWith("subagents:rpc:consume:reply:r1", expect.objectContaining({ success: true }));
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("a completion pending while its agent is resumed", () => {
+  const resume = (b: BootedPi, parentCtx: any, id: string, prompt: string, background: boolean) =>
+    b.tools.get("Agent").execute(
+      `call-${prompt}`,
+      { prompt, description: prompt, subagent_type: "general-purpose", resume: id, run_in_background: background },
+      undefined, undefined, parentCtx,
+    );
+
+  it("still reports the first run when a background resume starts before the boundary", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+
+    await resume(b, b.parentCtx, id, "again", true);
+    turnEnd(b);
+    expect(sentContents(b)).toEqual([expect.stringContaining("alpha done")]);
+
+    runs.settle("again");
+    await vi.advanceTimersByTimeAsync(0);
+    turnEnd(b);
+    expect(sentContents(b)).toEqual([expect.stringContaining("alpha done"), expect.stringContaining("again done")]);
+  });
+
+  it("still reports the first run, not the inline result, when a foreground resume runs before the boundary", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const inline = resume(b, b.parentCtx, id, "again", false);
+    await vi.advanceTimersByTimeAsync(0);
+    runs.settle("again");
+    await inline;
+    turnEnd(b);
+
+    const sent = sentContents(b);
+    expect(sent).toEqual([expect.stringContaining("alpha done")]);
+    expect(sent[0]).not.toContain("again done");
+  });
+
+  it("does not report a run whose result was read before a background resume", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+
+    await b.tools.get("get_subagent_result").execute("read", { agent_id: id }, undefined, undefined, b.parentCtx);
+    await resume(b, b.parentCtx, id, "again", true);
+    turnEnd(b);
+
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 });
 

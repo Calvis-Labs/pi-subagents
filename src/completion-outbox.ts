@@ -29,10 +29,14 @@ export interface OutboxMessage {
 }
 
 /**
- * Built when the outbox flushes, not when the item is added: a result consumed
- * in the meantime returns `undefined` and is never delivered.
+ * A notification for one or more agents, built when they finished: a resume
+ * before the send must not rewrite it. Reading an agent's result cancels its
+ * id; `build` gets the ids still pending and returns `undefined` for none.
  */
-export type OutboxItem = () => OutboxMessage | undefined;
+export interface OutboxItem {
+  ids: string[];
+  build(ids: readonly string[]): OutboxMessage | undefined;
+}
 
 export class CompletionOutbox {
   private items: OutboxItem[] = [];
@@ -45,7 +49,9 @@ export class CompletionOutbox {
     private parentRunning: () => boolean,
   ) {}
 
+  /** A newer completion of the same agent (a resume) replaces its pending one. */
   add(item: OutboxItem): void {
+    for (const id of item.ids) this.cancel(id);
     this.items.push(item);
     if (!this.parentRunning()) this.arm();
   }
@@ -56,6 +62,12 @@ export class CompletionOutbox {
     // what is held waits for the next boundary or the run's end — sent now,
     // it would sit in a queue pi is about to clear.
     if (stopReason !== "aborted" && stopReason !== "error") this.flush();
+  }
+
+  /** The agent's result was read: it must not also be notified. */
+  cancel(id: string): void {
+    for (const item of this.items) item.ids = item.ids.filter(i => i !== id);
+    this.items = this.items.filter(item => item.ids.length > 0);
   }
 
   /** Completions that landed after the run's last `turn_end` would otherwise wait for the next run. */
@@ -85,7 +97,7 @@ export class CompletionOutbox {
     const messages: OutboxMessage[] = [];
     for (const item of items) {
       try {
-        const message = item();
+        const message = item.build(item.ids);
         if (message) messages.push(message);
       } catch { /* a stale completion must not take the others down */ }
     }

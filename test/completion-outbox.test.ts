@@ -9,7 +9,8 @@ function details(id: string, others?: NotificationDetails[]): NotificationDetail
   };
 }
 
-const item = (id: string): OutboxItem => () => ({ content: `<done ${id}>`, details: details(id) });
+const message = (id: string) => ({ content: `<done ${id}>`, details: details(id) });
+const item = (id: string): OutboxItem => ({ ids: [id], build: () => message(id) });
 
 describe("CompletionOutbox", () => {
   let running: boolean;
@@ -93,16 +94,44 @@ describe("CompletionOutbox", () => {
     });
   });
 
-  it("drops a completion whose result was consumed before the send", () => {
-    let consumed = false;
-    outbox.add(() => (consumed ? undefined : { content: "<done a>", details: details("a") }));
-    consumed = true;
+  describe("cancel — the result was read before the send", () => {
+    it("drops that agent's notification", () => {
+      outbox.add(item("a"));
+      outbox.add(item("b"));
+      outbox.cancel("a");
+      vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
+      expect(send).toHaveBeenCalledExactlyOnceWith(message("b"));
+    });
+
+    it("builds a group's notification from the members still unread", () => {
+      const build = vi.fn((ids: readonly string[]) => ({ content: ids.join(","), details: details(ids[0]) }));
+      outbox.add({ ids: ["a", "b"], build });
+      outbox.cancel("a");
+      vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
+      expect(build).toHaveBeenCalledExactlyOnceWith(["b"]);
+      expect(send).toHaveBeenCalledExactlyOnceWith({ content: "b", details: details("b") });
+    });
+
+    it("sends nothing once every member was read", () => {
+      const build = vi.fn(() => message("a"));
+      outbox.add({ ids: ["a", "b"], build });
+      outbox.cancel("a");
+      outbox.cancel("b");
+      vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
+      expect(build).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
+  it("replaces an agent's pending notification with its newer completion", () => {
+    outbox.add(item("a"));
+    outbox.add({ ids: ["a"], build: () => ({ content: "<done a again>", details: details("a") }) });
     vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
-    expect(send).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledExactlyOnceWith({ content: "<done a again>", details: details("a") });
   });
 
   it("flattens a group's agents into one list of details", () => {
-    outbox.add(() => ({ content: "<group>", details: details("a", [details("b")]) }));
+    outbox.add({ ids: ["a", "b"], build: () => ({ content: "<group>", details: details("a", [details("b")]) }) });
     outbox.add(item("c"));
     vi.advanceTimersByTime(NOTIFICATION_HOLD_MS);
     expect(send.mock.calls[0][0].details).toEqual({ ...details("a"), others: [details("b"), details("c")] });
