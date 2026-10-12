@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > - **`group` no longer groups a lone spawn, or spawns from different parent turns.**
 
 ### Added
-- **A pi package can ship subagents and workflow scripts** ([#109](https://github.com/tintinweb/pi-subagents/issues/109) — thanks [@iamfj](https://github.com/iamfj), [@RicardoMonteiroSimoes](https://github.com/RicardoMonteiroSimoes) and [@Brambovich](https://github.com/Brambovich)). Distributing an agent used to mean telling users to copy `.md` files into `.pi/agents/`. A package now declares them instead, and `pi install` is the whole setup:
+- **A pi package can ship subagents and workflow scripts** ([#109](https://github.com/tintinweb/pi-subagents/issues/109), [#262](https://github.com/tintinweb/pi-subagents/pull/262) — thanks [@iamfj](https://github.com/iamfj), [@RicardoMonteiroSimoes](https://github.com/RicardoMonteiroSimoes) and [@Brambovich](https://github.com/Brambovich)). Distributing an agent used to mean telling users to copy `.md` files into `.pi/agents/`. A package now declares them instead, and `pi install` is the whole setup:
   ```json
   { "pi": { "subagents": { "agents": ["./agents"], "workflows": ["./workflows"] } } }
   ```
