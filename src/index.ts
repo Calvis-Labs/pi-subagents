@@ -1445,6 +1445,7 @@ export default function (pi: ExtensionAPI) {
     outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
   });
   pi.on("agent_end", () => outbox.onAgentEnd());
+  pi.on("agent_settled", () => outbox.onAgentEnd());
 
   /** Build the full type list text dynamically from available agents only. */
   const buildTypeListText = () => {

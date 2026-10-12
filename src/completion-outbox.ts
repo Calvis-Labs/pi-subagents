@@ -70,7 +70,10 @@ export class CompletionOutbox {
     this.items = this.items.filter(item => item.ids.length > 0);
   }
 
-  /** Completions that landed after the run's last `turn_end` would otherwise wait for the next run. */
+  /**
+   * Completions that landed after the run's last `turn_end` would otherwise wait for the next run.
+   * Called at `agent_end` and again at `agent_settled`: one can land while the ending run is still open.
+   */
   onAgentEnd(): void {
     if (this.items.length > 0) this.arm();
   }

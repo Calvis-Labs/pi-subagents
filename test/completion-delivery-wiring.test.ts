@@ -120,6 +120,23 @@ describe("completion delivery to a running parent", () => {
     expect(sentContents(b)).toEqual([expect.stringContaining("alpha done")]);
   });
 
+  it("sends a completion that landed while the ending run was still open, once the run settles", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    turnEnd(b, "stop");
+    b.lifecycle.get("agent_end")({ type: "agent_end", messages: [] });
+
+    runs.settle("alpha"); // lands while a later agent_end listener still holds the run open
+    await vi.advanceTimersByTimeAsync(0);
+    b.parent.running = false;
+    b.lifecycle.get("agent_settled")?.({ type: "agent_settled", aborted: false });
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(sentContents(b)).toEqual([expect.stringContaining("alpha done")]);
+  });
+
   it("drops what is still pending when the session shuts down", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
