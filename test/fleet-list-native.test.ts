@@ -65,6 +65,43 @@ function mount(Tui: typeof TuiMainScreen | typeof TuiAltScreen, count = 2) {
 }
 
 describe.each([TuiMainScreen, TuiAltScreen])("FleetList native %s input", Tui => {
+  it.each([DOWN, LEFT])("keeps fresh and staggered starts collapsed until %j", key => {
+    const h = mount(Tui, 1);
+    expect(h.render()).toEqual([]);
+    h.agents.push({ ...h.agents[0], id: "queued", description: "queued task", status: "queued", session: undefined });
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    h.agents[1].status = "running";
+    h.agents[1].session = h.agents[0].session;
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    h.press(key);
+    expect(h.render().join("\n")).toContain("queued task");
+    h.press(ESC);
+    h.agents.push({ ...h.agents[0], id: "later", description: "later task" });
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    h.press(key);
+    expect(h.render().join("\n")).toContain("later task");
+    expect(h.abort).not.toHaveBeenCalled();
+  });
+
+  it("keeps workflow-only starts collapsed until explicitly opened", () => {
+    const h = mount(Tui, 0);
+    const workflows = [{ id: "workflow", name: "workflow-only", status: "running" as const, doneCount: 0, totalCount: 2, startedAt: Date.now(), tokens: 0 }];
+    h.fleet.setWorkflowSource(() => workflows, vi.fn());
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    h.press(LEFT);
+    expect(h.render().join("\n")).toContain("workflow-only");
+    h.press(ESC);
+    workflows.push({ ...workflows[0], id: "later", name: "later workflow" });
+    h.fleet.update();
+    expect(h.render()).toEqual([]);
+    h.press(DOWN);
+    expect(h.render().join("\n")).toContain("later workflow");
+  });
+
   it.each([
     ["Enter on main", [DOWN, ENTER]],
     ["Up on main", [DOWN, UP]],
@@ -73,7 +110,10 @@ describe.each([TuiMainScreen, TuiAltScreen])("FleetList native %s input", Tui =>
     ["printable input", [DOWN, DOWN, "q"]],
   ])("visibly dismisses on %s without stopping agents", (_name, keys) => {
     const h = mount(Tui);
+    expect(h.render()).toEqual([]);
+    h.press(LEFT);
     expect(h.render().join("\n")).toContain("task 0");
+    h.press(ESC);
     expect(h.statuses.get("subagents")).toBe("2 running agents");
     for (const key of keys) h.press(key);
     expect(h.render()).toEqual([]);
@@ -104,6 +144,7 @@ describe.each([TuiMainScreen, TuiAltScreen])("FleetList native %s input", Tui =>
 
   it.each([1, 8])("has exactly one trailing blank row with %i agents, none when dismissed", count => {
     const h = mount(Tui, count);
+    h.press(DOWN);
     for (const width of [20, 120]) {
       const lines = h.render(width);
       expect(lines.at(-1)).toBe("");
@@ -139,7 +180,7 @@ describe.each([TuiMainScreen, TuiAltScreen])("FleetList native %s input", Tui =>
   it("ignores releases before activation, during navigation and after dismissal", () => {
     const h = mount(Tui);
     h.press("\x1b[1;1:3B");
-    expect(h.render()[0]).toContain("← for agents");
+    expect(h.render()).toEqual([]);
     h.press(DOWN);
     h.press("\x1b[1;1:3B");
     expect(h.render().find(line => line.includes("main"))).toContain("●");

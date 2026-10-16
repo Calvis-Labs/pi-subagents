@@ -203,6 +203,7 @@ describe("custom agent color runtime surfaces", () => {
 
     try {
       fleet.update();
+      fleet.handleKey("\x1b[B");
       const output = factory?.(
         { requestRender: vi.fn(), terminal: { columns: 120, rows: 40 } },
         theme,

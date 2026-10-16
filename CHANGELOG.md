@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **FleetView starts collapsed** (CAL-16511). Starting agents or workflows no longer expands the below-editor list before explicit Down or Left navigation at an empty prompt. The above-editor widget and status count are unchanged.
 - **Fleet navigation visibly collapses when returning to the prompt** (CAL-16477). Enter on main, Up reaching main, Esc, or typing hides the expanded list without stopping agents; Down or Left at an empty prompt reopens it. Autocomplete keeps its navigation keys, and the expanded list has one trailing blank row.
 
 ## [0.20.0] - 2026-10-09

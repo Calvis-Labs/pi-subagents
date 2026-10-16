@@ -222,6 +222,7 @@ describe("FleetList navigation", () => {
       makeRecord({ id: "top", description: "top-level" }),
       makeRecord({ id: "nested", description: "nested-child", parentAgentId: "top" }),
     ]);
+    h.press(DOWN);
     const output = h.render().join("\n");
     expect(output).toContain("top-level");
     expect(output).not.toContain("nested-child");
@@ -360,6 +361,7 @@ describe("FleetList navigation", () => {
         setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
         notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
       });
+      fleet.handleKey(DOWN);
       fleet.update();          // shows list, arms the timer
       fleet.setEnabled(false); // hides, clears the timer
       fleet.setEnabled(true);  // re-shows — must re-arm the timer
@@ -427,9 +429,10 @@ describe("FleetList vs other focused components (#123)", () => {
 describe("FleetList rendering", () => {
   it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
+    h.press(DOWN);
     const lines = h.render(120);
     // hint + blank + main + one agent
-    expect(lines[0]).toContain("← for agents");
+    expect(lines[0]).toContain("enter view");
     expect(lines.find(l => l.includes("main"))).toContain("●"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("○");
@@ -443,7 +446,9 @@ describe("FleetList rendering", () => {
       makeRecord({ id: "new", description: "newest", startedAt: 2000 }),
       makeRecord({ id: "old", description: "oldest", startedAt: 1000 }),
     ];
-    const lines = harness(agents).render();
+    const h = harness(agents);
+    h.press(DOWN);
+    const lines = h.render();
     const oldIdx = lines.findIndex(l => l.includes("oldest"));
     const newIdx = lines.findIndex(l => l.includes("newest"));
     expect(oldIdx).toBeGreaterThanOrEqual(0);
@@ -455,7 +460,9 @@ describe("FleetList rendering", () => {
       makeRecord({ id: "live", description: "running one" }),
       makeRecord({ id: "pending", description: "queued one", status: "queued", session: undefined }),
     ];
-    const lines = harness(agents).render();
+    const h = harness(agents);
+    h.press(DOWN);
+    const lines = h.render();
     expect(lines.some(l => l.includes("running one"))).toBe(true);
     expect(lines.some(l => l.includes("queued one"))).toBe(false);
   });
@@ -464,6 +471,7 @@ describe("FleetList rendering", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `report ${i}` }));
     const h = harness(agents);
+    h.press(DOWN);
     const lines = h.render(120);
     // 8 agents, cap 5 visible → "↓ 3 more"
     expect(lines.some(l => l.includes("↓ 3 more"))).toBe(true);
@@ -473,6 +481,7 @@ describe("FleetList rendering", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `a very long agent description number ${i} that keeps going` }));
     const h = harness(agents);
+    h.press(DOWN);
     for (const w of [4, 8, 12, 20, 40, 80, 200]) {
       for (const line of h.render(w)) {
         expect(visibleWidth(line)).toBeLessThanOrEqual(w);
@@ -572,9 +581,15 @@ describe("FleetList overlay lifecycle", () => {
 
   it("lingers a finished agent in the list, then drops it after the window", () => {
     const recent = makeRecord({ id: "r", description: "recent done", status: "completed", completedAt: Date.now() });
-    expect(harness([recent]).render().some(l => l.includes("recent done"))).toBe(true);
+    const h = harness([recent]);
+    h.press(DOWN);
+    expect(h.render().some(l => l.includes("recent done"))).toBe(true);
     const old = makeRecord({ id: "o", description: "old done", status: "completed", completedAt: Date.now() - 60_000 });
-    expect(harness([old]).render().some(l => l.includes("old done"))).toBe(false);
+    const withOld = harness([makeRecord({ id: "live", description: "running control" }), old]);
+    withOld.press(DOWN);
+    const rendered = withOld.render().join("\n");
+    expect(rendered).toContain("running control");
+    expect(rendered).not.toContain("old done");
   });
 });
 
@@ -593,6 +608,7 @@ describe("FleetList cost display", () => {
       custom: (() => new Promise(() => {})) as any,
     } as any);
     fleet.update();
+    fleet.handleKey(DOWN);
     return factory({ requestRender: () => {}, terminal: { columns: 120, rows: 40 } }, theme).render(120).join("\n");
   }
 
@@ -603,8 +619,10 @@ describe("FleetList cost display", () => {
   });
 
   it("shows no cost when disabled, and none for an unpriced model", () => {
-    expect(row(false, 0.0042)).not.toContain("$");
-    expect(row(true, 0)).not.toContain("$");
+    for (const output of [row(false, 0.0042), row(true, 0)]) {
+      expect(output).toContain("13.1k tokens");
+      expect(output).not.toContain("$");
+    }
   });
 
   it("reads the record, so the figures do not change when the agent finishes", () => {
@@ -634,11 +652,14 @@ describe("FleetList workflow rows", () => {
     // before they existed. Asserted as an equality rather than an absence, so
     // a future change to the roster cannot quietly alter the agents-only path.
     const withNone = harness([makeRecord({ id: "a1", description: "one" })]);
+    withNone.press(DOWN);
     const before = withNone.render().join("\n");
+    expect(before).toContain("one");
     expect(before).not.toContain("workflow");
 
     const withEmpty = harness([makeRecord({ id: "a1", description: "one" })]);
     withEmpty.setWorkflows([]);
+    withEmpty.press(DOWN);
     expect(withEmpty.render().join("\n")).toBe(before);
   });
 
@@ -662,6 +683,7 @@ describe("FleetList workflow rows", () => {
   it("clears the widget when the last run and the last agent both go", () => {
     const h = harness([]);
     h.setWorkflows([makeWorkflow()]);
+    h.press(DOWN);
     expect(h.render().length).toBeGreaterThan(0);
 
     h.setWorkflows([]);
@@ -671,6 +693,7 @@ describe("FleetList workflow rows", () => {
   it("lists a run above the agents, with its counts and stats", () => {
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
     h.setWorkflows([makeWorkflow()]);
+    h.press(DOWN);
 
     const rows = h.render().map(plain).filter(row => row.trim() !== "");
     const run = rows.find(row => row.includes("audit-src"))!;
@@ -685,6 +708,7 @@ describe("FleetList workflow rows", () => {
   it("agrees with itself about a single-agent run", () => {
     const h = harness([]);
     h.setWorkflows([makeWorkflow({ doneCount: 1, totalCount: 1 })]);
+    h.press(DOWN);
     expect(h.render().map(plain).join("\n")).toContain("1/1 agent ");
   });
 
@@ -696,6 +720,7 @@ describe("FleetList workflow rows", () => {
       makeRecord({ id: "w1", description: "the workflow's", workflowId: "wf_abc123" }),
     ]);
     h.setWorkflows([makeWorkflow()]);
+    h.press(DOWN);
 
     const rendered = h.render().map(plain).join("\n");
     expect(rendered).toContain("mine");
@@ -805,6 +830,7 @@ describe("FleetList workflow rows", () => {
       makeWorkflow({ id: "wf_old", name: "old", status: "completed", completedAt: Date.now() - 60 * 60_000 }),
       makeWorkflow({ id: "wf_now", name: "now" }),
     ]);
+    h.press(DOWN);
 
     const rendered = h.render().map(plain).join("\n");
     expect(rendered).toContain("now");
@@ -816,6 +842,7 @@ describe("FleetList workflow rows", () => {
     // Inside FINISHED_LINGER_MS, or the row would be gone before it could be read.
     const completedAt = Date.now() - 1_000;
     h.setWorkflows([makeWorkflow({ status: "completed", startedAt: completedAt - 12_000, completedAt })]);
+    h.press(DOWN);
 
     expect(h.render().map(plain).join("\n")).toContain("12s");
   });

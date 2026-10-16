@@ -106,7 +106,7 @@ export class FleetList {
   private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
   private active = false;
-  private dismissed = false;
+  private dismissed = true;
   /** 0 = `main`, 1..N = subagents. */
   private selectedIndex = 0;
   /** Set while a conversation overlay is open; calling it closes the overlay. */
