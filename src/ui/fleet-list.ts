@@ -11,7 +11,7 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Editor, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -106,6 +106,7 @@ export class FleetList {
   private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
   private active = false;
+  private dismissed = true;
   /** 0 = `main`, 1..N = subagents. */
   private selectedIndex = 0;
   /** Set while a conversation overlay is open; calling it closes the overlay. */
@@ -326,7 +327,8 @@ export class FleetList {
     // (ctx.ui.select/confirm/input, pi's own menus) swap the prompt editor out
     // while getEditorText() still reads the detached — empty — editor. So when
     // anything but the editor owns the keyboard, stay out of its keys (#123).
-    if (!this.editorHasFocus()) {
+    const focused = this.tui?.getFocusedComponent?.() ?? this.tui?.focusedComponent;
+    if (!this.editorHasFocus() || (focused instanceof Editor && focused.isShowingAutocomplete())) {
       if (this.active) this.deactivate();
       return undefined;
     }
@@ -338,6 +340,7 @@ export class FleetList {
       // workflow run still has somewhere to go, and requiring an agent would
       // render the row but refuse to move into it.
       if (isActivator && this.roster().length > 1 && this.ui.getEditorText() === "") {
+        this.dismissed = false;
         this.active = true;
         this.selectedIndex = 0;
         this.update();
@@ -354,7 +357,7 @@ export class FleetList {
       return { consume: true };
     }
     if (matchesKey(data, "up")) {
-      if (this.selectedIndex === 0) { this.deactivate(); return { consume: true }; }
+      if (this.selectedIndex <= 1) { this.deactivate(); return { consume: true }; }
       this.selectedIndex -= 1;
       this.update();
       return { consume: true };
@@ -384,6 +387,7 @@ export class FleetList {
   }
 
   private deactivate(): void {
+    this.dismissed = true;
     this.active = false;
     this.selectedIndex = 0;
     this.update();
@@ -472,6 +476,7 @@ export class FleetList {
   // ---- Rendering ----
 
   private renderBar(width: number, theme: Theme): string[] {
+    if (this.dismissed && !this.active) return [];
     const rows = this.roster().slice(1) as (WorkflowEntry | AgentEntry)[];
     if (rows.length === 0) return [];
     // Clamp locally so a render between a roster shrink and the next update()
