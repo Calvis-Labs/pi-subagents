@@ -199,6 +199,19 @@ describe("formatFleetTokens", () => {
 });
 
 describe("FleetList navigation", () => {
+  it("starts collapsed until explicit navigation (CAL-16511)", () => {
+    const h = harness([makeRecord()]);
+    try {
+      expect(h.render()).toEqual([]);
+      h.fleet.update();
+      expect(h.render()).toEqual([]);
+      expect(h.press(DOWN)).toEqual({ consume: true });
+      expect(h.render().join("\n")).toContain("Sleep then report 1");
+    } finally {
+      h.fleet.dispose();
+    }
+  });
+
   it("does not register a widget when there are no agents", () => {
     const h = harness([]);
     expect(h.render()).toEqual([]);
