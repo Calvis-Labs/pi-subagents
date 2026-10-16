@@ -312,22 +312,21 @@ describe("FleetList navigation", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN); // activate, index 0
     expect(h.press(UP)).toEqual({ consume: true });
-    // back to inactive hint
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
   });
 
   it("Esc deactivates", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN);
     expect(h.press(ESC)).toEqual({ consume: true });
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
   });
 
   it("passes non-nav keys through and cancels navigation", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN);
     expect(h.press(RIGHT)).toBeUndefined();
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
   });
 
   it("ignores all input while disabled and hides the widget", () => {
@@ -396,8 +395,7 @@ describe("FleetList vs other focused components (#123)", () => {
     expect(h.press(DOWN)).toBeUndefined();
     expect(h.press(ENTER)).toBeUndefined();
     expect(h.press(ESC)).toBeUndefined();
-    // and the list dropped back to its inactive hint
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
   });
 
   it("still activates when the prompt editor has focus", () => {
@@ -488,7 +486,7 @@ describe("FleetList overlay lifecycle", () => {
     h.press(DOWN); // active, index 0 (main)
     h.press(ENTER);
     expect(h.overlayOpened()).toBe(false); // never opened an overlay
-    expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
+    expect(h.render()).toEqual([]);
   });
 
   it("keeps the cursor on the viewed agent after closing, even if the list reordered", async () => {

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Fleet navigation visibly collapses when returning to the prompt** (CAL-16477). Enter on main, Up reaching main, Esc, or typing hides the expanded list without stopping agents; Down or Left at an empty prompt reopens it. Autocomplete keeps its navigation keys, and the expanded list has one trailing blank row.
+
 ## [0.20.0] - 2026-10-09
 
 > **⚠️ Breaking — this release requires pi 1.1.0 or newer** (`peerDependencies` moves from `>=0.84.0`; [#384](https://github.com/tintinweb/pi-subagents/pull/384)). pi 0.86 and 0.87 moved the system prompt and conversation history into the session transcript, and the fixes below are built on that model. On an older pi, a mention clone starts its agent without the conversation history.
