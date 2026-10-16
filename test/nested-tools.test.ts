@@ -286,6 +286,16 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  // #368 — a nested resume carries the caller's turn budget like a spawn does.
+  it("passes max_turns through on a nested resume", async () => {
+    const [agent] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true });
+
+    await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue", max_turns: 3 });
+
+    expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined, expect.objectContaining({ maxTurns: 3 }));
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error

@@ -28,7 +28,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
-const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
+const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop", "subagents:rpc:consume", "subagents:rpc:steer"] as const;
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -132,7 +132,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
 
     await lifecycle.get("session_start")({}, ctx());
 
-    // Readiness broadcast once, all three channels now live.
+    // Readiness broadcast once, all five channels now live.
     expect(readyEmits(pi), "subagents:ready fires once bound").toHaveLength(1);
     for (const channel of RPC_CHANNELS) {
       expect(busHandlers.has(channel), `${channel} registered on session_start`).toBe(true);
@@ -154,6 +154,40 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply, "spawn emitted a reply").toBeTruthy();
     expect(reply![1].success, `spawn succeeded, got: ${JSON.stringify(reply![1])}`).toBe(true);
     expect(reply![1].data.id).toBeTruthy();
+  });
+
+  // The RPC handler emits nothing itself: the event comes from the manager's
+  // onSteered callback wired in src/index.ts. This pins that the bus path
+  // reaches it, so observers do not miss bus-originated steers.
+  it("subagents:rpc:steer emits subagents:steered for an RPC-spawned agent", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+
+    await lifecycle.get("session_start")({}, ctx());
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any); // never resolves
+    try {
+      await busHandlers.get("subagents:rpc:spawn")!({
+        requestId: "req-steer-spawn",
+        type: "general-purpose",
+        prompt: "go",
+        options: { description: "rpc steer test" },
+      });
+      const spawnReply = pi.events.emit.mock.calls.find(
+        (c: any[]) => c[0] === "subagents:rpc:spawn:reply:req-steer-spawn",
+      );
+      const id: string = spawnReply![1].data.id;
+
+      await busHandlers.get("subagents:rpc:steer")!({ requestId: "req-steer", agentId: id, message: "also fix the lint" });
+
+      const steerReply = pi.events.emit.mock.calls.find(
+        (c: any[]) => c[0] === "subagents:rpc:steer:reply:req-steer",
+      );
+      expect(steerReply![1]).toEqual({ success: true });
+      expect(pi.events.emit).toHaveBeenCalledWith("subagents:steered", { id, message: "also fix the lint" });
+    } finally {
+      await lifecycle.get("session_shutdown")();
+    }
   });
 
   it("renders an RPC-spawned agent in the native widget while it is running", async () => {
