@@ -21,8 +21,10 @@ import {
   type WorkflowDialogState,
   workflowDialogContentWidth,
 } from "../src/ui/workflow-dialog.js";
+import { showWorkflowDialog } from "../src/ui/workflow-menu.js";
 import type { WorkflowMeta } from "../src/workflow/meta.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "../src/workflow/progress.js";
+import { createWorkflowTask } from "../src/workflow/task.js";
 
 const START = 1_000_000;
 
@@ -75,12 +77,7 @@ const stripMarkup = (line: string) => line.replace(/<\/?[a-zA-Z]+>|\*/g, "");
 /** Strip the markup and a heading's focus marker / padding. */
 const bare = (line: string) => stripMarkup(line).replace(/^[\s▸>]+/, "");
 
-/* --- reading the framed layout ---------------------------------------------
- *
- * Every body row is `│<left cell>│<right cell>│`, so a pane is read by taking
- * one side of every row. Trailing blank rows are dropped: the frame pads to a
- * fixed height, and a test asserting on "the rows" means the ones with content.
- */
+/* Read the upper list and the lower, full-width framed panel. */
 
 /**
  * The frame's body rows, as (left, right) cell pairs.
@@ -95,8 +92,8 @@ function cells(lines: string[]): { left: string; right: string }[] {
   const rows: { left: string; right: string }[] = [];
   for (const line of lines) {
     const parts = line.split(new RegExp(BORDER.source, "g"));
-    if (parts.length === 4 && parts[0].trim() === "" && parts[3].trim() === "") {
-      rows.push({ left: parts[1], right: parts[2] });
+    if (parts.length === 3 && parts[0].trim() === "" && parts[2].trim() === "") {
+      rows.push({ left: "", right: parts[1] });
     }
   }
   return rows;
@@ -109,16 +106,19 @@ const trimTrailing = (rows: string[]): string[] => {
   return out;
 };
 
-const leftRows = (lines: string[]): string[] => trimTrailing(cells(lines).map(row => row.left));
+const leftRows = (lines: string[]): string[] => {
+  const frame = lines.findIndex(line => /^[╭+]/.test(bare(line)));
+  return lines.slice(4, frame);
+};
 const rightRows = (lines: string[]): string[] => trimTrailing(cells(lines).map(row => row.right));
 
 /** The two pane titles from the frame's top edge. */
 function paneTitles(lines: string[]): { left: string; right: string } {
   for (const line of lines) {
-    const match = bare(line).match(/^[╭+](.*?)[┬+](.*)[╮+]$/);
+    const match = bare(line).match(/^[╭+](.*)[╮+]$/);
     if (match) {
       const strip = (part: string) => part.replace(/[─-]+\s*$/, "").trim();
-      return { left: strip(match[1]), right: strip(match[2]) };
+      return { left: bare(lines[3]), right: strip(match[1]) };
     }
   }
   throw new Error(`no frame in:\n${lines.join("\n")}`);
@@ -144,6 +144,139 @@ const detail = (over: DialogOverrides): string[] =>
 /* ------------------------------------------------------------------------- *
  * Glyphs
  * ------------------------------------------------------------------------- */
+
+describe("vertical workflow layout", () => {
+  const progress: WorkflowEntry[] = [
+    { type: "workflow_phase", index: 0, title: "Discover" },
+    { type: "workflow_phase", index: 1, title: "Verify" },
+    agentEntry({ index: 0, label: "discover:src", state: "done", model: "runtime-model", tokens: 26400, durationMs: 25000 }),
+    agentEntry({ index: 1, label: "second", state: "done" }),
+  ];
+
+  it("places the full-width agents frame below every phase", () => {
+    const lines = dialog({ progress });
+    const panel = lines.findIndex(line => line.includes("╭ Discover"));
+    expect(panel).toBeGreaterThan(lines.findIndex(line => line.includes("2 Verify")));
+    expect(lines.join("\n")).not.toMatch(/[┬┴]/);
+    expect(lines.find(line => line.includes("discover:src"))).toContain("runtime-model · 26.4k tok");
+    expect(lines.find(line => line.includes("discover:src"))).toContain("25s");
+  });
+
+  it("handles actual terminal arrow sequences at both navigation levels", () => {
+    let full = input({ progress });
+    const press = (key: string) => {
+      const result = handleWorkflowDialogKey(key, full.state, resolveWorkflowDialog(full));
+      if (result) full = { ...full, state: result.state };
+      return result;
+    };
+    expect(press("\x1b[B")?.state.selectedPhase).toBe(1);
+    expect(press("\x1b[A")?.state.selectedPhase).toBe(0);
+    expect(press("\x1b[C")?.state.level).toBe("agent");
+    expect(press("\x1b[B")?.state.selectedAgent).toBe(1);
+    expect(press("\x1b[A")?.state.selectedAgent).toBe(0);
+    expect(press("\x1b[D")?.state.level).toBe("phases");
+    expect(press("\x1b")?.action).toEqual({ kind: "cancel" });
+  });
+
+  it("fits the real menu overlay at 62x26 and 48x18, including after resize", async () => {
+    const terminal = { columns: 62, rows: 26 };
+    const task = createWorkflowTask({ id: "wf_viewport", script: "" });
+    task.workflowProgress = Array.from({ length: 12 }, (_, index) => ({ type: "workflow_phase", index, title: `stage-${index}` }));
+    task.workflowProgress.push(...Array.from({ length: 12 }, (_, index) => agentEntry({ index, phaseIndex: index, label: `child-${index}` })));
+    let instance: WorkflowDialog | undefined;
+    let heightPercent = 0;
+    let widthPercent = 0;
+    const context = { ui: {
+      custom: async (factory: (tui: never, themeArg: typeof theme, keys: undefined, done: () => void) => WorkflowDialog,
+        options: { overlayOptions: { maxHeight: string; width: string } }) => {
+        heightPercent = Number.parseFloat(options.overlayOptions.maxHeight);
+        widthPercent = Number.parseFloat(options.overlayOptions.width);
+        instance = factory({ terminal, requestRender() {} } as never, theme, undefined, () => {});
+      },
+    } };
+    await showWorkflowDialog(context as never, task, {
+      tasks: new Map([[task.id, task]]), getRecord: () => undefined,
+      getCtx: () => undefined, viewAgentConversation: async () => {},
+    });
+    if (!instance) throw new Error("menu did not create inspector");
+    try {
+      for (const [columns, rows] of [[62, 26], [48, 18], [62, 26]]) {
+        Object.assign(terminal, { columns, rows });
+        const render = () => instance!.render(Math.floor(columns * widthPercent / 100));
+        let lines = render();
+        expect(lines.length).toBeLessThanOrEqual(Math.floor(rows * heightPercent / 100));
+        expect(lines.join("\n")).toContain("esc close");
+        expect(lines.join("\n")).toContain("child-");
+        for (let i = 0; i < 12; i++) instance.handleInput("\x1b[B");
+        lines = render();
+        expect(lines.join("\n")).toContain("stage-11");
+        expect(lines.join("\n")).toContain("child-11");
+        expect(lines.join("\n")).toContain("esc close");
+        expect(lines.length).toBeLessThanOrEqual(Math.floor(rows * heightPercent / 100));
+      }
+    } finally { instance.dispose(); }
+  });
+
+  it("windows long phase and agent lists around clamped selections", () => {
+    const many: WorkflowEntry[] = Array.from({ length: 50 }, (_, index) => ({ type: "workflow_phase", index, title: `phase-${index}` }));
+    many.push(...Array.from({ length: 100 }, (_, index) => agentEntry({ index, phaseIndex: 49, label: `child-${index}`, state: "done" })));
+    for (const level of ["phases", "agent"] as const) {
+      const lines = dialog({ progress: many, height: 16, state: { level, selectedPhase: 500, selectedAgent: 500 } });
+      expect(lines.length).toBeLessThanOrEqual(16);
+      expect(lines.join("\n")).toContain("phase-49");
+      expect(lines.join("\n")).toContain("child-99");
+      expect(lines.join("\n")).not.toContain("child-0 ");
+    }
+    const filtered = input({ progress: many, state: { selectedPhase: 500, selectedAgent: 500, filter: "running" } });
+    expect(resolveWorkflowDialog(filtered)).toMatchObject({ clampedPhase: 49, clampedAgent: 0, visibleAgents: [] });
+  });
+
+  it("stacks Prompt, Activity and Outcome and omits unknown metadata", () => {
+    const lines = detail({ progress: [agentEntry({ index: 0, state: "done", promptPreview: "inspect", resultPreview: "finished" })] });
+    const positions = ["Prompt", "Activity", "Outcome"].map(text => lines.findIndex(line => line.includes(text)));
+    expect(positions[0]).toBeGreaterThan(0);
+    expect(positions[1]).toBeGreaterThan(positions[0]);
+    expect(positions[2]).toBeGreaterThan(positions[1]);
+    expect(lines.join("\n")).not.toMatch(/[┬┴]|thinking:| tok|runtime-model/);
+    for (const line of lines.filter(line => line.includes("│"))) expect(line.match(/│/g)).toHaveLength(2);
+  });
+
+  it("scrolls long details to the outcome, clamps at the end, and resets on agent movement", () => {
+    const tui = { requestRender() {}, terminal: { rows: 18, columns: 86 } } as never;
+    const instance = new WorkflowDialog(tui, () => input({ progress: [
+      agentEntry({ index: 0, state: "done", promptPreview: Array.from({ length: 60 }, (_, i) => `prompt-${i}`).join("\n"), resultPreview: "final-outcome" }),
+      agentEntry({ index: 1, state: "done" }),
+    ] }), theme, () => {});
+    try {
+      instance.handleInput("\r");
+      instance.handleInput("\r");
+      expect(instance.render(86).join("\n")).toContain("prompt-0");
+      for (let i = 0; i < 30; i++) {
+        instance.handleInput("\x1b[6~");
+        expect(instance.render(86).length).toBeLessThanOrEqual(18);
+      }
+      const end = instance.render(86).join("\n");
+      expect(end).toContain("final-outcome");
+      instance.handleInput("\x1b[5~");
+      expect(instance.render(86).join("\n")).not.toBe(end);
+      instance.handleInput("\x1b[B");
+      expect(instance.render(86).join("\n")).toContain("Prompt");
+    } finally { instance.dispose(); }
+  });
+
+  it.each([1, 4, 8, 12, 18, 24])("fits a %i-row terminal and retains the exit hint", height => {
+    const tui = { requestRender() {}, terminal: { rows: height, columns: 86 } } as never;
+    const instance = new WorkflowDialog(tui, () => input({ progress }), theme, () => {});
+    try {
+      for (const key of ["", "\r", "e"]) {
+        instance.handleInput(key);
+        const lines = instance.render(86);
+        expect(lines.length).toBeLessThanOrEqual(height);
+        expect(lines.at(-1)).toContain("esc");
+      }
+    } finally { instance.dispose(); }
+  });
+});
 
 describe("dialog glyph mapping", () => {
   const live: WorkflowEntry[] = [
@@ -561,15 +694,13 @@ describe("keys", () => {
     expect(handleWorkflowDialogKey("\r", empty.state, resolveWorkflowDialog(empty))?.state.level).toBe("phases");
   });
 
-  it("swaps which pane holds which list when it opens", () => {
+  it("keeps full-width lists above the detail when it opens", () => {
     const overview = dialog({ progress });
     expect(paneTitles(overview).left).toBe("Phases");
     expect(paneTitles(overview).right).toBe("Review · 2 agents");
 
     const opened = dialog({ progress, state: { level: "agent" } });
-    // The agents move left and the selected one's detail takes the right. The
-    // left title is truncated to the narrow pane, marker and all.
-    expect(paneTitles(opened).left).toBe("Review · 2 agen…");
+    expect(paneTitles(opened).left).toBe("Review · 2 agents");
     expect(paneTitles(opened).right).toBe("a");
   });
 
@@ -1074,17 +1205,13 @@ describe("key hints reflect the wired actions", () => {
     },
   ];
 
-  it("drops the conversation hint before the way out on a narrow terminal", () => {
-    // The footer is clamped, not wrapped, so a hint added at the end costs
-    // whatever was already there. `c convo` is last precisely so that an
-    // 80-column terminal loses it rather than `esc back` — every other key
-    // either moves the cursor, changes the run, or is the escape hatch.
-    const narrow = dialog({ progress: everyKey, width: 80, state: { level: "agent" } }).at(-1) ?? "";
+  it("wraps hints without losing the way out on a narrow terminal", () => {
+    const narrow = dialog({ progress: everyKey, width: 80, state: { level: "agent" } }).slice(-2).join("\n");
     expect(narrow).toContain("esc back");
   });
 
   it("shows every hint once the terminal has room", () => {
-    const wide = dialog({ progress: everyKey, width: 100, state: { level: "agent" } }).at(-1) ?? "";
+    const wide = dialog({ progress: everyKey, width: 200, state: { level: "agent" } }).at(-1) ?? "";
     for (const key of ["↑↓ agent", "⏎ prompt", "s skip", "r retry", "p pause", "x stop", "esc back", "c convo"]) {
       expect(wide).toContain(key);
     }

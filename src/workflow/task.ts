@@ -64,6 +64,7 @@ export interface WorkflowTask {
   workflowProgress: WorkflowEntry[];
   /** Bumped once per applied batch, so a renderer can tell nothing changed. */
   progressVersion: number;
+  onChange?: () => void;
   agentCount: number;
   /**
    * Agents that have settled successfully, recomputed with the other counters.
@@ -161,6 +162,7 @@ export function updateWorkflowProgressBatch(
   task.totalTokens = totalTokens;
   task.totalToolCalls = totalToolCalls;
   task.doneCount = done;
+  task.onChange?.();
 }
 
 /**
@@ -174,6 +176,7 @@ export function pauseWorkflowTask(task: WorkflowTask, now = Date.now()): boolean
   task.control.pause();
   task.status = "paused";
   task.pausedAt = now;
+  task.onChange?.();
   return true;
 }
 
@@ -184,6 +187,7 @@ export function resumeWorkflowTask(task: WorkflowTask, now = Date.now()): boolea
   task.status = "running";
   task.totalPausedMs = (task.totalPausedMs ?? 0) + Math.max(0, now - (task.pausedAt ?? now));
   task.pausedAt = undefined;
+  task.onChange?.();
   return true;
 }
 
@@ -206,6 +210,7 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
   task.value = result.value;
   task.error = result.error;
   task.endTime = Date.now();
+  task.onChange?.();
 }
 
 /**
@@ -218,6 +223,7 @@ export function failWorkflowTask(task: WorkflowTask, error: string): void {
   task.status = "failed";
   task.error = error;
   task.endTime = Date.now();
+  task.onChange?.();
 }
 
 /** The run's outcome as text, for the notification and the LLM-facing result. */
@@ -280,7 +286,7 @@ export function resolveResumeTarget(
 
 /** `<task-notification>`, in the same shape a finished background agent sends. */
 export function formatWorkflowNotification(task: WorkflowTask, now = Date.now()): string {
-  const totals = stats(task.workflowProgress, task.agentCount);
+  const totals = stats(collapse(task.workflowProgress).agents, task.agentCount);
   const status =
     task.status === "completed" ? "Done"
     : task.status === "killed" ? "Stopped"

@@ -8,6 +8,7 @@
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
+ *   /workflows              — Inspect this session's workflow runs
  */
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -74,6 +75,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
+import { WORKFLOW_PROGRESS_CHANNEL, WORKFLOW_PROGRESS_REQUEST_CHANNEL, workflowProgressSnapshot } from "./workflow/snapshot.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -800,6 +802,8 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  let workflowSessionId: string | undefined;
+  let unsubWorkflowProgress: (() => void) | undefined;
   /** Whether the `@handle` autocomplete wrapper has been stacked on pi's provider. */
   let mentionProviderRegistered = false;
 
@@ -829,6 +833,13 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (workflowSessionId !== undefined && workflowSessionId !== sessionId) clearWorkflowTasks();
+    workflowSessionId = sessionId;
+    if (!unsubWorkflowProgress) {
+      unsubWorkflowProgress = pi.events.on(WORKFLOW_PROGRESS_REQUEST_CHANNEL, emitWorkflowProgress);
+    }
+    emitWorkflowProgress();
     // Pi resolves project trust before the first session starts, so this is the
     // earliest honest answer. The activation-time load defaulted to untrusted,
     // so a trusted project's `packages[]` only becomes visible now.
@@ -1151,6 +1162,10 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubConsume();
     rpcHandle?.unsubSteer();
     rpcHandle = undefined;
+    unsubWorkflowProgress?.();
+    unsubWorkflowProgress = undefined;
+    clearWorkflowTasks();
+    workflowSessionId = undefined;
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
@@ -1158,10 +1173,6 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
-    // Before abortAll, and not folded into it: a workflow owns a worker thread
-    // as well as its children, and only its own signal terminates that.
-    for (const task of workflowTasks.values()) task.abortController.abort();
-    workflowTasks.clear();
     manager.abortAll();
     // Activation-owned UI and group state (#256): `session_shutdown` also runs for
     // reload and session replacement, where the Node process survives, so a live
@@ -2546,6 +2557,30 @@ Terse command-style prompts produce shallow, generic work.
    */
   const workflowTasks = new Map<string, WorkflowTask>();
 
+  function emitWorkflowProgress(): void {
+    if (workflowSessionId === undefined) return;
+    pi.events.emit(WORKFLOW_PROGRESS_CHANNEL, workflowProgressSnapshot(workflowSessionId, workflowTasks.values()));
+  }
+
+  function trackWorkflowTask(task: WorkflowTask): void {
+    workflowTasks.set(task.id, task);
+    task.onChange = () => {
+      if (workflowTasks.get(task.id) === task) emitWorkflowProgress();
+    };
+    emitWorkflowProgress();
+  }
+
+  function clearWorkflowTasks(): void {
+    const tasks = [...workflowTasks.values()];
+    for (const task of tasks) outbox.cancel(task.id);
+    workflowTasks.clear();
+    emitWorkflowProgress();
+    for (const task of tasks) {
+      task.onChange = undefined;
+      task.abortController.abort();
+    }
+  }
+
   /**
    * Workflow runs as the fleet list wants them.
    *
@@ -2613,6 +2648,7 @@ Terse command-style prompts produce shallow, generic work.
    * boundary — rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
+    if (workflowTasks.get(task.id) !== task) return;
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
@@ -2779,7 +2815,7 @@ Terse command-style prompts produce shallow, generic work.
         ...(journalPath !== undefined ? { journalPath } : {}),
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
-      workflowTasks.set(runId, task);
+      trackWorkflowTask(task);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
       // surfaces — nothing else would register the widget for a run whose
@@ -2937,7 +2973,7 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
-    workflowTasks.set(task.id, task);
+    trackWorkflowTask(task);
     widget.update();
     fleet.update();
     report(`Running workflow ${meta.name}…`, "info");
@@ -2945,6 +2981,7 @@ Terse command-style prompts produce shallow, generic work.
     // Detached: session_start is awaited by the host, and a workflow can run for
     // minutes — blocking here would hold the whole session's startup.
     void runWorkflowTask(ctx, task).then(() => {
+      if (workflowTasks.get(task.id) !== task) return;
       // No tool call to attach a result card to, so the card becomes a session
       // entry (same layout), and the outcome is handed to the model as context
       // for its next turn rather than forcing one.
@@ -4292,9 +4329,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
   });
 
   /**
-   * What `/agents → Workflows` and the fleet list's `workflow` rows need from
-   * here. One object, built once: both entry points open the same inspector,
-   * and handing them different views of the session would let the two drift.
+   * Shared by `/workflows`, `/agents → Workflows`, and the fleet list's
+   * `workflow` rows so every entry point opens the same inspector.
    */
   const workflowMenuDeps: WorkflowMenuDeps = {
     tasks: workflowTasks,
@@ -4304,6 +4340,23 @@ Write the file using the write tool. Only write the file, nothing else.`;
     // fleet list may act between sessions, when there is none.
     getCtx: () => currentCtx as unknown as ExtensionCommandContext | undefined,
   };
+
+  pi.registerCommand("workflows", {
+    description: "Inspect workflow runs",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        const message = "/workflows requires the interactive TUI. Use SubagentWorkflow to run workflows and read their completion notifications for results.";
+        if (ctx.hasUI) ctx.ui.notify(message, "info");
+        else console.warn(`[pi-subagents] ${message}`);
+        return;
+      }
+      if (!isWorkflowsEnabled()) {
+        ctx.ui.notify("Workflows are disabled. Enable via /agents → Settings → Workflows.", "info");
+        return;
+      }
+      await showWorkflowsMenu(ctx, workflowMenuDeps);
+    },
+  });
 
   fleet.setWorkflowSource(fleetWorkflows, id => openWorkflowFromFleet(id, workflowMenuDeps));
 }

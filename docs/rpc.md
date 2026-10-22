@@ -6,6 +6,60 @@ The thing worth understanding up front is that **the bus is in-process.** Every 
 
 For the channel list, the reply envelope, the per-channel snippets and the event table, see [`README.md`](../README.md#cross-extension-rpc). This document is the reference README does not have room for: the complete spawn-option surface, every error string, the notification race, the registry, and what protocol version `2` does and does not promise.
 
+## Workflow progress snapshots (v1)
+
+For an external persistent workflow UI, subscribe to `subagents:workflow-progress:v1`, then emit `subagents:workflow-progress:request:v1` with `{}`. The request broadcasts a fresh authoritative snapshot on the same progress channel, synchronously, without a request id or RPC envelope. This is an in-process observation protocol, not a workflow-control API, and its version is independent of `subagents:rpc:ping`.
+
+```typescript
+interface WorkflowProgressSnapshot {
+  version: 1;
+  sessionId: string;
+  workflows: {
+    id: string;
+    name: string;
+    status: "running" | "paused" | "completed" | "failed" | "killed";
+    startTime: number;
+    endTime?: number;
+    phases: { title: string; state: string; done: number; total: number }[];
+    agents: { index: number; label: string; state: string; phaseTitle?: string }[];
+    done: number;
+    total: number;
+  }[];
+}
+```
+
+Times are Unix epoch milliseconds. Optional fields are omitted, not `undefined`. Each payload is a detached projection: mutating it cannot change the tasks or a future snapshot. Only the fields above are sent; there are no prompts, results, errors, scripts, paths, logs, model details or raw task records. Names, labels and phase titles are author-supplied display text, not a redaction guarantee for text an author puts in those fields.
+
+Consumers must filter by their current `sessionId` and **replace**, not merge, that session's workflow list. Workflows are in creation order; agents are in ascending index order, with last-write-wins progress collapsed before counting. Completed, failed and killed workflows stay in the list until teardown. `done` counts only successful children (including journal-replayed successes), not failed/skipped/blocked children. Workflow `total` is the maximum of scheduled count and observed child count; phase `total` is its observed child count. Neither predicts future calls or means percentage of the script completed; totals can grow and retries can change states.
+
+### State contract
+
+Agent `state` comes from `displayState` in `src/workflow/progress.ts`:
+
+- `done`: successful terminal entry.
+- `failed`, `skipped`, `blocked`: error entry, with skip/block flags taking precedence over failure.
+- `queued`: live entry with a queue timestamp and no start timestamp.
+- `running`: any other live entry while the workflow is running **or paused**. Pausing holds new starts, not children already working.
+- `interrupted`: a live entry left behind after the workflow completed, failed or was killed.
+
+Phases reuse `buildPhaseGroups` and its declared-title prefix matching, with empty observed phases included. When there are no declared phases, phase events or agent phase assignments, `phases` is `[]` so consumers can show the individual agents. A real phase named `Agents` is preserved; detection never depends on the title. In mixed runs, unassigned children appear in a separate `Ungrouped agents` summary row rather than being attributed to phase index zero. Every observed child contributes to exactly one group row when phases exist. Agent phase assignments are recognized even without a phase event (an index with no known title uses `Phase <index>`). Group titles are display text, not unique identifiers.
+
+Phase states:
+
+- `not-started`: declared phase with neither a matching emitted phase nor children. It remains not-started even if the workflow completes.
+- `observed`: `phase()` was emitted but the group has no children. The protocol has no phase-end event, so it never invents successful completion for an empty phase. This is activity evidence, not a claim that it is still executing.
+- With children, the first applicable state wins: `running`, `queued`, `interrupted`, `failed` (any failed/skipped/blocked child), otherwise `done` (all children successful). These summarize currently observed children; a phase can receive more children later.
+
+### Lifecycle and discovery
+
+The request handler is registered on bound `session_start`, **before** `subagents:ready`, never at factory time. Subscribe before requesting; request on your own session startup and again on `subagents:ready` to handle either extension load order. Before binding, after shutdown, or when the extension is absent/filtered out, requests receive no response. No timer or polling is needed.
+
+Unchanged task projections are cached; each emission still returns detached rows, and explicit requests, creation and terminal transitions remain synchronous.
+
+Full snapshots are emitted at session startup, workflow creation (tool and CLI flag), every nonempty progress batch, successful pause/resume, and terminal completion/failure/kill. They cover workflow children only, not standalone agents. Nested child activations do not register or publish. Shutdown unregisters the request listener and broadcasts `{ version: 1, sessionId: currentId, workflows: [] }`, clears the tracked tasks and aborts their workers. Late callbacks from those tasks cannot publish snapshots, completion notifications or CLI result transcript entries into a subsequent session. Pending workflow notifications are cancelled before the tasks are removed. Rebinding to a different session also clears the old session with its old id before publishing the new session's snapshot. No workflow history is restored from disk by this protocol.
+
+Source: `src/workflow/snapshot.ts`, task transitions in `src/workflow/task.ts`, and activation wiring in `src/index.ts`. Regression coverage: `test/workflow-progress-events.test.ts` and `test/workflow-snapshot.test.ts`.
+
 ## Spawn options
 
 `subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` in `src/index.ts`, which deletes internal-only fields first, and then `spawnResolved` overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` in `src/agent-manager.ts`; what a bus caller actually gets is three different things.

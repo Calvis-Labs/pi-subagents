@@ -15,8 +15,10 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatWorkflowNotification,
   pauseWorkflowTask,
   resumeWorkflowTask,
+  updateWorkflowProgressBatch,
   type WorkflowTask,
 } from "../src/workflow/task.js";
 
@@ -90,6 +92,20 @@ describe("pausing a run", () => {
     expect(resumeWorkflowTask(task, 4_000)).toBe(false);
     expect(control.resume).toHaveBeenCalledTimes(1);
   });
+});
+
+it("counts unique children in notifications regardless of repeated progress", () => {
+  const { task } = runningTask();
+  for (const state of ["start", "progress", "progress", "progress", "done"] as const) {
+    updateWorkflowProgressBatch(task, Array.from({ length: 7 }, (_, index) => ({
+      type: "workflow_agent" as const, index, label: `child-${index}`, state,
+    })));
+  }
+  expect(formatWorkflowNotification(task)).toContain("7/7 agents");
+  updateWorkflowProgressBatch(task, [{ type: "workflow_agent", index: 0, label: "child-0", state: "done" }]);
+  expect(formatWorkflowNotification(task)).toContain("7/7 agents");
+  task.agentCount = 9;
+  expect(formatWorkflowNotification(task)).toContain("7/9 agents");
 });
 
 describe("settling a run", () => {

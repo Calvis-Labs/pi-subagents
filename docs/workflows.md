@@ -18,7 +18,7 @@ Use the `Agent` tool for one delegated task, or a handful you can name up front.
 
 ### 1. Ask for one
 
-There is no `/workflows` command. The tool is model-invoked, so you get a workflow by asking for one in the prompt — the same way you ask for anything else. What you say shapes what you get:
+Ask for a workflow in the prompt to start one; `/workflows` inspects existing runs rather than launching scripts. The tool is model-invoked, so what you say shapes what you get:
 
 | What you say | What you get |
 |---|---|
@@ -52,7 +52,7 @@ Three things in there matter.
 
 ### 3. Watch it run
 
-Three surfaces, in increasing order of detail.
+Three surfaces, in increasing order of detail. In the interactive TUI, `/workflows` opens the only run directly, offers a newest-first picker when there are several, or reports that the session has no workflows. It reuses the same inspector and controls as `/agents → Workflows` and FleetView. Outside the TUI it reports that the inspector is unavailable; use `SubagentWorkflow` for execution and its completion notification for the outcome. When workflows are disabled, the command points to `/agents → Settings → Workflows`.
 
 A **card in the transcript**, updating as the run goes:
 
@@ -72,7 +72,7 @@ A **`workflow` row in FleetView**, above the agents, carrying its agent counts w
 
 Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
 
-The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
+The **inspector**, at `/workflows` or `/agents → Workflows`, has two navigation levels and a vertical layout: a full-width phase list with counts above a bordered panel of that phase's agents. Arrows select phases; `Enter` or `Right` enters agent selection. Arrows then select agents, with their Prompt, Activity and Outcome stacked below the list. `Enter` expands the prompt and `PageUp`/`PageDown` scroll detail by the visible panel height, including after resize. `Left` or `Esc` returns to phases; overview `Esc` or either level's `Ctrl+C` closes. The lists scroll around the selection and the panel shrinks for short terminals, keeping the header and footer within the viewport. The detail panel has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
 |---|---|
@@ -80,6 +80,8 @@ The **inspector**, at `/agents → Workflows` — two panes, two levels: phases 
 | `p` | Pause — running agents finish, no new ones start, and held time comes off the clock |
 | `s` | **Skip** the selected agent: its `agent()` call returns `null` in the script |
 | `r` | **Retry** the selected agent: the child is stopped and the same call runs again |
+
+The selected agent stays selected when new phases regroup the list. If it disappears or no longer matches the filter, agent actions stay disabled until you select another row. Inspector text is rendered without terminal-control or bidirectional-control sequences; multiline previews retain their line breaks.
 
 `s` and `r` are not view filters. Skipping an agent puts a `null` into the data your script is assembling, exactly as a terminal failure would; the script carries on with a hole in its results.
 
@@ -92,6 +94,8 @@ The fifth key only shows you something:
 Because it changes nothing, `c` works at both levels and on an agent that has already settled — which is the usual case, since reading what a child did is most of why the inspector gets opened. The dialog hides itself while the conversation is up and comes back when you close it. A row with no child behind it yet (queued, or replayed from the resume journal) has no conversation to open and does not offer the key.
 
 A run's own agents are not listed separately in the fleet list, the widget, the `/agents` menus or `@handle` resolution — they belong to the run, which reports for them. `c` in the inspector is the one way in to a child's conversation.
+
+Other extensions can observe the same session's workflow progress through the supported in-process `subagents:workflow-progress:v1` snapshot channel. Subscribe, then emit `subagents:workflow-progress:request:v1` with `{}` for the initial state. Snapshots include workflow status, phase/child states and counts, not prompts or results. An empty phase that has been invoked is `observed`, not complete; declared unseen phases remain `not-started`. This adds no rendering or control surface. See the [full protocol contract](rpc.md#workflow-progress-snapshots-v1).
 
 ### 4. Edit and re-run
 
@@ -128,7 +132,7 @@ The file must carry an `export const meta = { name, description }` declaration. 
 
 Then invoke it by name: *"run the auth-audit workflow"*. The model passes `name: "auth-audit"` and the run reports that file back as its `Script:`, so the edit-and-re-run loop still works on it.
 
-**Nothing lists your saved workflows for you.** `/agents → Workflows` is a *run* inspector scoped to the current session, not a workflow browser — with five workflows saved on disk it will show you nothing. You reach a saved workflow by naming it to the model, or with [`--subagents-workflow-file=`](../README.md#cli-flags). Keeping the names memorable is on you.
+**Nothing lists your saved workflows for you.** `/workflows` (also `/agents → Workflows`) is a *run* inspector scoped to the current session, not a workflow browser — with five workflows saved on disk it will show you nothing. You reach a saved workflow by naming it to the model, or with [`--subagents-workflow-file=`](../README.md#cli-flags). Keeping the names memorable is on you.
 
 ### 6. Parameterize it
 
@@ -411,7 +415,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
 - **No scheduled workflows.** The scheduler runs agents, not workflows.
 - **Results are not persisted** beyond the journal and the transcript card.
-- **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
+- **Observation only from another extension.** The progress snapshot protocol above is read-only; it does not drive a workflow. A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
 
 The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.
 
