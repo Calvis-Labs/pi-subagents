@@ -133,6 +133,8 @@ describe("the inspector opens a workflow agent's conversation", () => {
     // to open and the key is correctly not advertised.
     await vi.waitFor(() => expect(dialog.render?.(120).at(-1)).toContain("c convo"));
 
+    dialog.handleInput?.("\x1b[C");
+    expect(dialog.render?.(120).join("\n")).toContain("Prompt");
     dialog.handleInput?.("c");
     await vi.waitFor(() => expect(ui.overlays).toHaveLength(2));
 
@@ -148,6 +150,10 @@ describe("the inspector opens a workflow agent's conversation", () => {
     // And back, so closing the conversation returns to the run it was opened
     // from rather than to an empty screen.
     await vi.waitFor(() => expect(ui.hidden).toEqual([true, false]));
+    expect(dialog.render?.(120).join("\n")).toContain("Prompt");
+    expect(dialog.render?.(120).join("\n")).toContain("child");
+    dialog.handleInput?.("\x1b[D");
+    expect(dialog.render?.(120).join("\n")).not.toContain("Prompt");
 
     ui.overlays[0].close();
   });

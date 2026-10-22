@@ -298,9 +298,18 @@ function mergePhases(
 export function buildPhaseGroups(
   progress: readonly WorkflowEntry[],
   declared?: readonly WorkflowPhaseMeta[],
+  includeEmptyPhases = false,
 ): PhaseGroup[] {
   const { agents, phaseTitles } = collapse(progress);
   const observed = groupByPhase(agents, phaseTitles) ?? [];
+  if (includeEmptyPhases) {
+    for (const [phaseIndex, title] of phaseTitles) {
+      if (!observed.some(group => group.phaseIndex === phaseIndex)) {
+        observed.push({ phaseIndex, title, agents: [] });
+      }
+    }
+    observed.sort((a, b) => a.phaseIndex - b.phaseIndex);
+  }
   const merged = mergePhases(declared, observed);
   if (merged.length === 0 && agents.length > 0) {
     return [summarize({ title: "Agents", agents })];
@@ -312,6 +321,31 @@ export function buildPhaseGroups(
     return [...merged, summarize({ title: "Agents", agents })];
   }
   return merged;
+}
+
+/** Shared inspector/telemetry grouping, retaining complete entries for controls. */
+export function buildWorkflowPhaseGroups(
+  progress: readonly WorkflowEntry[],
+  declared?: readonly WorkflowPhaseMeta[],
+): PhaseGroup[] {
+  const { agents, phaseTitles } = collapse(progress);
+  const assigned = agents.filter(agent => agent.phaseIndex !== undefined || agent.phaseTitle !== undefined);
+  const ungrouped = agents.filter(agent => agent.phaseIndex === undefined && agent.phaseTitle === undefined);
+  if (!declared?.length && phaseTitles.size === 0 && assigned.length === 0) return [];
+  let nextPhaseIndex = Math.max(-1, ...phaseTitles.keys(), ...assigned.map(agent => agent.phaseIndex ?? -1)) + 1;
+  const phasedAgents = assigned.map(agent => {
+    const phaseIndex = agent.phaseIndex
+      ?? [...phaseTitles].find(([, title]) => title === agent.phaseTitle)?.[0]
+      ?? nextPhaseIndex++;
+    if (!phaseTitles.has(phaseIndex)) phaseTitles.set(phaseIndex, agent.phaseTitle ?? `Phase ${phaseIndex}`);
+    return { ...agent, phaseIndex };
+  });
+  const groups = buildPhaseGroups([
+    ...[...phaseTitles].map(([index, title]) => ({ type: "workflow_phase" as const, index, title })),
+    ...phasedAgents,
+  ], declared, true);
+  if (ungrouped.length > 0) groups.push(summarize({ title: "Ungrouped agents", agents: ungrouped }));
+  return groups;
 }
 
 /**

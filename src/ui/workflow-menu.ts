@@ -1,17 +1,8 @@
 /**
- * workflow-menu.ts — `/agents → Workflows`, and the run inspector behind it.
+ * workflow-menu.ts — shared `/workflows` and `/agents → Workflows` run inspector.
  *
- * The same shape `schedule-menu.ts` has for `/agents → Scheduled jobs`: the
- * submenu and the overlay it opens live here, and everything they need arrives
- * as {@link WorkflowMenuDeps} rather than through a closure. The inspector is
- * reached from two places — this menu and a `workflow` row in the fleet list —
- * and both go through `showWorkflowDialog`, so the two entry points cannot
- * drift apart on what the keys do.
- *
- * Lives in the agents menu rather than as a top-level `/workflows` command: it
- * is one more view of the same fleet, and a second command name would only add
- * a collision surface (pi renames duplicate commands to `/workflows:1` and
- * `/workflows:2`, which breaks the bare name for both).
+ * Both commands use this menu; it and the fleet list's `workflow` rows open
+ * `showWorkflowDialog` with the same dependencies so the controls cannot drift.
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -138,6 +129,8 @@ export async function showWorkflowDialog(
               .finally(() => overlay?.setHidden(false));
           },
         },
+        0,
+        () => tui.terminal ? Math.floor((tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100) : undefined,
       ),
     {
       overlay: true,
@@ -163,7 +156,7 @@ export function openWorkflowFromFleet(id: string, deps: WorkflowMenuDeps): Promi
   return showWorkflowDialog(ctx, task, deps);
 }
 
-/** `/agents → Workflows` — list this session's runs, open one. */
+/** `/workflows` and `/agents → Workflows` — list this session's runs, open one. */
 export async function showWorkflowsMenu(
   ctx: ExtensionCommandContext,
   deps: WorkflowMenuDeps,

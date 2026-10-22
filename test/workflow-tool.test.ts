@@ -28,6 +28,7 @@ import type { AgentRecord } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
+import * as workflowTasks from "../src/workflow/task.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 /* ------------------------------------------------------------------------- *
@@ -984,6 +985,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   it("kills a still-running workflow (and its worker thread) on session shutdown", async () => {
     // A never-returning script: only the run's own abort signal can stop it, so
     // abortAll() over the agent records would leave the worker spinning.
+    const settled = vi.spyOn(workflowTasks, "completeWorkflowTask");
     const result = await tools.get("SubagentWorkflow").execute(
       "tc-shutdown",
       { script: `${inlineScript}await new Promise(() => {});\n` },
@@ -992,8 +994,13 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
 
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    await vi.waitFor(() => expect(settled).toHaveBeenCalledWith(
+      expect.objectContaining({ id: startedTaskId(result), status: "killed" }),
+      expect.objectContaining({ status: "killed" }),
+    ));
+    await flush();
+    await booted.lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "stop" } });
+    expect(booted.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

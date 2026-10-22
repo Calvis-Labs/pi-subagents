@@ -41,6 +41,7 @@ function firstRow(lines: string[]): string | undefined {
 
 describe("regular conversation viewer", () => {
   it("retains its floating frame, height cap, and keyboard-only navigation", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     const { viewer, render, terminal, mouse, steer } = setup(30, 90, undefined, "always", "regular");
     try {
       const before = render();
@@ -66,6 +67,7 @@ describe("regular conversation viewer", () => {
       expect(viewer.render(5)).toEqual([]);
     } finally {
       viewer.dispose();
+      clock.mockRestore();
     }
   });
 });
@@ -299,16 +301,22 @@ describe("fullscreen conversation observer", () => {
   });
 
   it("consumes unused mouse events rather than allowing main-view selection or clicks", () => {
-    const { render, mouse, done, stop, steer } = setup();
-    const before = render();
-    for (const type of ["press", "drag", "release", "click", "move"] as const) {
-      expect(mouse({ type, button: "left", x: 10, y: 10 })).toMatchObject({ handled: true });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const { render, mouse, done, stop, steer, viewer } = setup();
+    try {
+      const before = render();
+      for (const type of ["press", "drag", "release", "click", "move"] as const) {
+        expect(mouse({ type, button: "left", x: 10, y: 10 })).toMatchObject({ handled: true });
+      }
+      expect(mouse({ type: "press", button: "right" })).toMatchObject({ handled: true });
+      expect(render()).toEqual(before);
+      expect(done).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      expect(steer).not.toHaveBeenCalled();
+    } finally {
+      viewer.dispose();
+      clock.mockRestore();
     }
-    expect(mouse({ type: "press", button: "right" })).toMatchObject({ handled: true });
-    expect(render()).toEqual(before);
-    expect(done).not.toHaveBeenCalled();
-    expect(stop).not.toHaveBeenCalled();
-    expect(steer).not.toHaveBeenCalled();
   });
 });
 

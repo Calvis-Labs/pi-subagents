@@ -1,27 +1,26 @@
 /**
- * workflow-command.test.ts — the `/agents → Workflows` run inspector.
+ * workflow-command.test.ts — `/workflows` and `/agents → Workflows` run inspection.
  *
  * The dialog itself is covered by workflow-dialog.test.ts; what is untested
  * until here is the screen around it: what happens with no runs, one run, or
  * several, and that stopping from the dialog actually aborts the run rather
  * than only looking like it did.
  *
- * It is reached through the agents menu rather than its own command, so every
- * test here drives `/agents` and picks the entry — which also pins that the
- * entry exists and is spelled the way the menu router expects.
+ * Both commands share the same run picker and inspector controls.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import subagentsExtension from "../src/index.js";
+import * as workflowMenu from "../src/ui/workflow-menu.js";
 import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
-/** Boot the real extension and hand back its `/agents` command. */
-function bootCommand() {
+/** Boot the real extension and hand back the requested command. */
+function bootCommand(name = "agents") {
   const booted = makePi();
   subagentsExtension(booted.pi);
-  const command = booted.commands.get("agents");
-  if (!command) throw new Error("the extension did not register /agents");
+  const command = booted.commands.get(name);
+  if (!command) throw new Error(`the extension did not register /${name}`);
   return { ...booted, command };
 }
 
@@ -86,17 +85,58 @@ function commandCtx() {
 describe("/agents → Workflows", () => {
   let hermetic: Hermetic;
 
-  // Workflows are opt-in, so every test that expects the feature to exist has
-  // to turn it on — the same thing a user does once in /agents → Settings.
   beforeEach(() => { hermetic = hermeticDir({ settings: { workflowsEnabled: true } }); });
   afterEach(() => { hermetic.restore(); });
 
-  it("registers no top-level /workflows command", () => {
-    // It lives under /agents instead, deliberately: pi renames a duplicate
-    // command to `/workflows:1` and `/workflows:2`, which breaks the bare name
-    // for both extensions. Pinned because re-adding it would be silent.
-    const booted = bootCommand();
-    expect(booted.commands.has("workflows")).toBe(false);
+  it.each([
+    { mode: "rpc", hasUI: true },
+    { mode: "json", hasUI: false },
+    { mode: "print", hasUI: false },
+  ])("/workflows refuses $mode without opening terminal UI", async ({ mode, hasUI }) => {
+    const { command } = bootCommand("workflows");
+    const ui = commandCtx();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await command.handler("", { ...ui.context, mode, hasUI });
+      expect(ui.context.ui.select).not.toHaveBeenCalled();
+      expect(ui.context.ui.custom).not.toHaveBeenCalled();
+      const notice = /\/workflows requires.*TUI.*SubagentWorkflow/i;
+      if (hasUI) {
+        expect(ui.notes.at(-1)?.text).toMatch(notice);
+        expect(warn).not.toHaveBeenCalled();
+      } else {
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(notice));
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("/workflows explains how to enable workflows when disabled", async () => {
+    hermetic.restore();
+    hermetic = hermeticDir({ settings: { workflowsEnabled: false } });
+    const { command } = bootCommand("workflows");
+    const ui = commandCtx();
+    await command.handler("", ui.context);
+    expect(ui.notes.at(-1)?.text).toMatch(/disabled.*\/agents → Settings → Workflows/i);
+    expect(ui.context.ui.select).not.toHaveBeenCalled();
+    expect(ui.built).toHaveLength(0);
+  });
+
+  it("routes both commands through the same menu and dependency object", async () => {
+    const { commands } = bootCommand();
+    const show = vi.spyOn(workflowMenu, "showWorkflowsMenu");
+    const ui = commandCtx();
+    try {
+      await commands.get("agents").handler("", ui.context);
+      await commands.get("workflows").handler("", ui.context);
+      expect(show).toHaveBeenCalledTimes(2);
+      expect(show.mock.calls[0][0]).toBe(ui.context);
+      expect(show.mock.calls[1][0]).toBe(ui.context);
+      expect(show.mock.calls[1][1]).toBe(show.mock.calls[0][1]);
+    } finally {
+      show.mockRestore();
+    }
   });
 
   it("offers the entry in the agents menu", async () => {
@@ -121,8 +161,8 @@ describe("/agents → Workflows", () => {
     expect(ui.agentsMenu().some(option => WORKFLOWS_ENTRY.test(option))).toBe(false);
   });
 
-  it("says so when the session has no workflows", async () => {
-    const { command } = bootCommand();
+  it.each(["agents", "workflows"])("/%s says so when the session has no workflows", async name => {
+    const { command } = bootCommand(name);
     const ui = commandCtx();
     await command.handler("", ui.context);
     expect(ui.notes.map(n => n.text).join("\n")).toMatch(/No workflows/i);
@@ -130,20 +170,20 @@ describe("/agents → Workflows", () => {
     expect(ui.built).toHaveLength(0);
   });
 
-  it("does not prompt for a choice when there is nothing to choose", async () => {
-    const { command } = bootCommand();
+  it.each(["agents", "workflows"])("/%s does not prompt when there is nothing to choose", async name => {
+    const { command } = bootCommand(name);
     const ui = commandCtx();
     await command.handler("", ui.context);
     expect(ui.askedWhichRun()).toBe(false);
   });
 
-  describe("with runs in the session", () => {
+  describe.each(["agents", "workflows"])("/%s with runs in the session", commandName => {
     const script = (name: string) =>
       `export const meta = { name: "${name}", description: "d" };\nreturn 1;\n`;
 
     /** Boot, then start `count` workflows so the session has tasks to inspect. */
     async function withRuns(count: number) {
-      const booted = bootCommand();
+      const booted = bootCommand(commandName);
       const runCtx = ctx({ cwd: hermetic.dir });
       for (let i = 0; i < count; i++) {
         await booted.tools.get("SubagentWorkflow").execute(`tc-${i}`, { script: script(`wf-${i}`) }, undefined, undefined, runCtx);
@@ -158,6 +198,7 @@ describe("/agents → Workflows", () => {
       // Straight to the dialog — asking which of one is noise.
       expect(ui.askedWhichRun()).toBe(false);
       expect(ui.built).toHaveLength(1);
+      if (commandName === "workflows") expect(ui.context.ui.select).not.toHaveBeenCalled();
     });
 
     it("asks which run when several exist, newest first", async () => {
@@ -217,6 +258,8 @@ describe("/agents → Workflows", () => {
       ui.reopen();
       await command.handler("", ui.context);
       expect(ui.built).toHaveLength(1);
+      const dialog = ui.built[0] as { render(w: number): string[] };
+      expect(dialog.render(100).join("\n")).toContain("wf-0");
     });
 
     it("pauses and resumes the run from the dialog", async () => {

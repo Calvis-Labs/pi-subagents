@@ -8,9 +8,9 @@
  * real assistant turn emitting TWO `Agent` tool calls in ONE message, and lets
  * pi's own `executeToolCallsParallel` dispatch them through `Promise.all`.
  *
- * Overlap is measured, not inferred: each child's faux model call increments an
- * in-flight counter, holds for a real interval, then decrements. Two agents
- * running at once drive `maxInFlight` to 2; serialized ones leave it at 1.
+ * Overlap is measured, not inferred: unlimited children rendezvous before
+ * completing, so startup jitter cannot hide concurrency. A bounded deadline
+ * still fails if the runtime serializes them.
  *
  * The unlimited control case is what makes the limited one meaningful — it
  * proves the detector can see parallelism at all, so `maxInFlight === 1` is a
@@ -33,7 +33,7 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const LIVE = /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
 
-/** How long each child holds the model call — long enough to overlap detectably. */
+/** The limited case holds a slot briefly to expose accidental overlap. */
 const CHILD_HOLD_MS = 120;
 
 describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => {
@@ -62,10 +62,14 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
    * the shape pi dispatches through Promise.all — plus a child responder that
    * measures how many children are in flight at once.
    */
-  async function twoBlockingAgents(settings: Record<string, unknown>) {
+  async function twoBlockingAgents(settings: Record<string, unknown>, secondChildDelayMs = 0) {
     let inFlight = 0;
     let maxInFlight = 0;
     const order: string[] = [];
+    let releaseOverlap: () => void = () => {};
+    const overlap = new Promise<void>(resolve => { releaseOverlap = resolve; });
+    let overlapTimer: ReturnType<typeof setTimeout> | undefined;
+    let overlapTimedOut = false;
 
     run = await runPrintMode({
       prompt: "Delegate two independent jobs and report both.",
@@ -86,18 +90,30 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
           ];
         }
 
-        // A child. Hold the model call so genuine overlap is observable.
+        // Rendezvous avoids treating slower child startup as serialization.
         const label = JSON.stringify(context.messages).includes("JOB-ALPHA") ? "alpha" : "beta";
+        if (label === "beta" && secondChildDelayMs) await new Promise(r => setTimeout(r, secondChildDelayMs));
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         order.push(`start:${label}`);
-        await new Promise(r => setTimeout(r, CHILD_HOLD_MS));
+        if (settings.maxConcurrentForeground === 0) {
+          if (inFlight === 2) {
+            clearTimeout(overlapTimer);
+            releaseOverlap();
+          } else {
+            overlapTimer = setTimeout(() => { overlapTimedOut = true; releaseOverlap(); }, 5000);
+          }
+          await overlap;
+        } else {
+          await new Promise(r => setTimeout(r, CHILD_HOLD_MS));
+        }
         order.push(`end:${label}`);
         inFlight--;
         return `${label.toUpperCase()}-RESULT`;
       },
-    });
+    }).finally(() => clearTimeout(overlapTimer));
 
+    expect(overlapTimedOut, "Both children must reach the overlap barrier").toBe(false);
     return { maxInFlight, order };
   }
 
@@ -118,6 +134,15 @@ describe.skipIf(LIVE)("maxConcurrentForeground e2e (real pi agent loop)", () => 
     // And the turn itself finished — the parent answered after both returned,
     // rather than the second call being left parked on a slot nobody freed.
     expect(run!.responseText).toContain("Both jobs are done.");
+  });
+
+  it("detects concurrency when one child starts after the old overlap window", async () => {
+    const { maxInFlight, order } = await twoBlockingAgents({ maxConcurrentForeground: 0 }, 400);
+    expect(maxInFlight).toBe(2);
+    expect(order.slice(0, 2).every(event => event.startsWith("start:"))).toBe(true);
+    const results = agentToolResults(run!.parentSession).join("\n");
+    expect(results).toContain("ALPHA-RESULT");
+    expect(results).toContain("BETA-RESULT");
   });
 
   // The control. Without this, the assertion above could pass on a detector
