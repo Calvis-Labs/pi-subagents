@@ -20,6 +20,9 @@ interface WorkflowProgressSnapshot {
     status: "running" | "paused" | "completed" | "failed" | "killed";
     startTime: number;
     endTime?: number;
+    reason?: { code: "timeout"; deadlineAt: number };
+    recoveryDisposition?: "interrupted" | "terminal";
+    draining: boolean;
     phases: { title: string; state: string; done: number; total: number }[];
     agents: { index: number; label: string; state: string; phaseTitle?: string }[];
     done: number;
@@ -29,9 +32,9 @@ interface WorkflowProgressSnapshot {
 }
 ```
 
+Times are Unix epoch milliseconds. `draining` is always an explicit boolean, including `false`; its absence identifies a runtime without drain evidence and consumers must not interpret absence as drained. Optional fields are omitted, not `undefined`. Each payload is a detached projection: mutating it cannot change the tasks or a future snapshot. Only the fields above are sent; there are no prompts, results, errors, scripts, paths, logs, model details or raw task records. Names, labels and phase titles are author-supplied display text, not a redaction guarantee for text an author puts in those fields.
 `plannedTotal`, when supplied by the author's `meta.totalAgents`, is a non-negative safe integer available before scheduling. It is a display plan only: `total` and `done` retain their observed-count semantics. Consumers can reserve `max(plannedTotal ?? 0, total)` slots; do not invent agent records or mark unstarted slots complete on termination. Omission means the final total is unknown, and observed work can exceed a declaration.
 
-Times are Unix epoch milliseconds. Optional fields are omitted, not `undefined`. Each payload is a detached projection: mutating it cannot change the tasks or a future snapshot. Only the fields above are sent; there are no prompts, results, errors, scripts, paths, logs, model details or raw task records. Names, labels and phase titles are author-supplied display text, not a redaction guarantee for text an author puts in those fields.
 
 Consumers must filter by their current `sessionId` and **replace**, not merge, that session's workflow list. Workflows are in creation order; agents are in ascending index order, with last-write-wins progress collapsed before counting. Completed, failed and killed workflows stay in the list until teardown. `done` counts only successful children (including journal-replayed successes), not failed/skipped/blocked children. Workflow `total` is the maximum of scheduled count and observed child count; phase `total` is its observed child count. Neither predicts future calls or means percentage of the script completed; totals can grow and retries can change states.
 
@@ -59,9 +62,26 @@ The request handler is registered on bound `session_start`, **before** `subagent
 
 Unchanged task projections are cached; each emission still returns detached rows, and explicit requests, creation and terminal transitions remain synchronous.
 
-Full snapshots are emitted at session startup, workflow creation (tool and CLI flag), every nonempty progress batch, successful pause/resume, and terminal completion/failure/kill. They cover workflow children only, not standalone agents. Nested child activations do not register or publish. Shutdown unregisters the request listener and broadcasts `{ version: 1, sessionId: currentId, workflows: [] }`, clears the tracked tasks and aborts their workers. Late callbacks from those tasks cannot publish snapshots, completion notifications or CLI result transcript entries into a subsequent session. Pending workflow notifications are cancelled before the tasks are removed. Rebinding to a different session also clears the old session with its old id before publishing the new session's snapshot. No workflow history is restored from disk by this protocol.
+Full snapshots are emitted at session startup, workflow creation (tool and CLI flag), every nonempty progress batch, successful pause/resume, and terminal completion/failure/kill. They cover workflow children only, not standalone agents. Nested child activations do not register or publish. Shutdown unregisters the request listener and broadcasts `{ version: 1, sessionId: currentId, workflows: [] }`, clears the tracked tasks and aborts their workers. Late callbacks from those tasks cannot publish snapshots, completion notifications or CLI result transcript entries into a subsequent session. Pending workflow notifications are cancelled before the tasks are removed. Rebinding to a different session also clears the old session with its old id before publishing the new session's snapshot. Session startup restores private workflow records as observations under the exact session ID and canonical cwd, before publishing the snapshot. Prior active records become interrupted failures; `recoveryDisposition` distinguishes these from recovered terminal records. Restore spawns no agents and sends no completion wake-ups. All recovered records reject replay; reconcile side effects and explicitly start fresh. `draining: true` means tracked host/child work has not drained, blocking every new workflow launch, not just replay. Same-process reload retains pending Promise ownership by canonical cwd/session; restored rows report that pending drain and update when it finishes. `false` means no known pending drain for that row, not proof of physical stop after a process restart. Recovery observations still require reconciliation, and missing unresolved transcript receipts, orphan artifacts or failed persistence block admission.
 
 Source: `src/workflow/snapshot.ts`, task transitions in `src/workflow/task.ts`, and activation wiring in `src/index.ts`. Regression coverage: `test/workflow-progress-events.test.ts` and `test/workflow-snapshot.test.ts`.
+
+## Agent invocation evidence
+
+`Agent` initial and resume receipts (foreground and background), and successful record lookups through `get_subagent_result`, carry:
+
+```typescript
+details.agent: {
+  id: string;
+  invocationId: string;
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  draining: boolean;
+}
+```
+
+`status` is the actual record status, not the UI's `background` label. Every accepted resume gets a distinct `invocationId`. `draining` reports the physical execution/cleanup lease, including startup: running work is `true`, queued work without a lease is `false`, and timed-out or cancelled work remains `true` until its execution settles. Neither terminal status nor `completedAt` proves drain. Unknown/unauthorized IDs carry no `agent` evidence; older/missing metadata must fail closed.
+
+Started/created and completion/failure events carry `invocationId` and `draining`; completion events additionally carry `agent`. Completion notifications carry the same nested `agent`, plus top-level `invocationId`/`draining`, independently for each grouped `others` member. XML includes `<invocation-id>` and `<draining>`. Notifications are point-in-time snapshots, not a second drain event: inspect the same invocation with `get_subagent_result` for current drain evidence. Drain only covers tracked execution, not proof that remote effects stopped after a process restart.
 
 ## Spawn options
 
@@ -75,16 +95,17 @@ Source: `src/workflow/snapshot.ts`, task transitions in `src/workflow/task.ts`, 
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
 | `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
+| `timeoutSeconds` | number | Positive finite seconds ≤86400; default `defaultAgentTimeoutSeconds` (1200). Starts at acceptance, including queue/setup/run. Tool spelling is `timeout_seconds`; combining it with `schedule` is rejected |
 | `isolated` | boolean | Strips extensions, skills and nested tools. Applies only when the agent file leaves `isolated:` unset — frontmatter is authoritative. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child. Only this option decides — an agent file's `inherit_context:` does not apply to RPC spawns |
 | `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
-| `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
+| `bypassQueue` | boolean | Bypasses the foreground/background pools, never aggregate `maxConcurrentTotal` (default 16). The executing slot remains charged until drain |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
 | `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion. The agent file's `isolation:` wins: `worktree` applies even when this is omitted, and `off` refuses it |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project, and the child reports this directory as untrusted (`ctx.isProjectTrusted()` is `false`) |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
-| `signal` | AbortSignal | Aborting it stops the subagent |
+| `signal` | AbortSignal | Requests cancellation; does not guarantee physical tools/providers or remote effects stopped |
 | `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions` |
 
 **Silently stripped** — set these and nothing happens, with no error and no note. Each deletion is a deliberate guard, and the reasons are worth knowing because they say what the surface refuses to let a caller forge:
@@ -108,6 +129,12 @@ Four things that are not obvious from the tables:
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (its field comment on `SpawnOptions`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
+
+### Deadlines and aggregate capacity
+
+Every invocation, including resumes, nested children, workflow agents, scheduled fires and bypass launches, shares `maxConcurrentTotal` (default 16, integer 1–1024). Logical timeout reports a failed outcome once with structured timeout reason; capacity stays occupied until execution/cleanup drains. Cancelling a parent immediately requests cancellation recursively. Uncooperative work may retain capacity indefinitely. Pending workflow and disposed-manager execution Promises fence workflow admission across same-process reload for the same cwd/session. The old manager's execution accounting is retained until drain, not inferred from persisted PIDs. Agent/RPC fresh launches and resumes also fail closed while that owner's old activation drains. Within one activation, a cancelled or timed-out physical lease blocks new admission and queued starts until it drains; ordinary concurrent work without cancellation retains the normal pools. No prompt, cwd override or worktree setting proves disjoint remote effects. Process restarts cannot prove that external tools, providers or remote effects stopped.
+
+Workflows default to 3600 seconds (`defaultWorkflowTimeoutSeconds`), including pauses and gates; the tool accepts explicit positive finite `timeoutSeconds` ≤86400. `workflowConcurrency` configures the per-run cap (1–1024; default `max(1, min(16, cpus - 2))`), subordinate to aggregate capacity. These settings are read from `subagents.json`; no RPC workflow-control verb is added.
 
 ### Names that look right and are not
 
@@ -165,7 +192,7 @@ Two asymmetries to know about, stated as they are:
 
 The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed`, `:steered` and `:compacted` all return early for nested and workflow-owned agents (the `isTopLevelAgent` checks in the `AgentManager` callbacks, `src/index.ts`). `subagents:usage` is the one event that is not scoped: it fires for every agent's messages, nested and workflow-owned included, so a ledger sees a workflow's children spend even though it never sees them start or finish.
 
-**`subagents:disposed` is the last event of a session.** It is emitted at the end of this extension's `session_shutdown`, after every agent is stopped and every child session has shut down, so no `subagents:usage` can follow it. A listener gets only its synchronous prefix on quit: `pi.events.emit` does not await listeners, and pi calls `process.exit` once the shutdown handlers return. Flush with `writeFileSync`, not `fs.promises`. Fields, and the other events, are in README's [event table](../README.md#events).
+**`subagents:disposed` marks activation teardown, not physical termination.** It is emitted at the end of this extension's `session_shutdown`, after cancellation and bounded child-session disposal. Uncooperative work can still drain afterward; consumers must not treat the event as proof that external effects stopped. A listener gets only its synchronous prefix on quit: `pi.events.emit` does not await listeners, and pi calls `process.exit` once the shutdown handlers return. Flush with `writeFileSync`, not `fs.promises`. Fields, and the other events, are in README's [event table](../README.md#events).
 
 ## The notification race
 

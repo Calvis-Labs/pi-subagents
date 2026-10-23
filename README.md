@@ -85,7 +85,7 @@ Press `ctrl+b` while a foreground `Agent` call is running to hand it to the back
 - Esc in the parent no longer reaches a handed-off agent. Stop it from `/agents → Running agents` with `x`.
 - It is one-way: there is no way back to foreground.
 - Other tool calls in the same assistant message still hold the model's next turn until they finish; pi runs a message's tool calls as one batch.
-- Not offered for a foreground call still queued for a slot, a foreground `resume`, a workflow's agents or nested children. There is no automatic timeout.
+- Not offered for a foreground call still queued for a slot, a foreground `resume`, a workflow's agents or nested children. There is no automatic handoff; the invocation still has its wall-clock deadline.
 
 ### Scheduling
 
@@ -114,9 +114,10 @@ Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`.
 **Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
 
 Restrictions:
+- `schedule` plus `timeout_seconds` is rejected until the scheduler supports per-job overrides. Fires use the default agent deadline.
 - `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
 - `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
-- Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
+- Scheduled fires bypass the `maxConcurrent` pool, but never the aggregate `maxConcurrentTotal` limit.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
 ## UI
@@ -379,7 +380,7 @@ allowed_subagents: support-file-finder, support-callsite-tracer   # or `all`
 
 The hard cap is depth 2 by default: main session (0) → subagent (1) → nested child (2). Change it project-wide with `maxSubagentDepth` in `subagents.json` (or `/agents → Settings → Nested depth`); `0` or `1` turns nesting off everywhere. An agent already at the cap gets no nested tools at all — not even `get_subagent_result`, since it can never own a child. A child must independently set `allowed_subagents` to delegate again; isolated agents never receive nested tools.
 
-Nested children occupy no concurrency slot, in either pool — their parent already holds one, and queueing them behind it would deadlock a parent waiting on its own child. The depth cap bounds how *deep* nesting goes, not how *wide*: a parent's only limit on concurrent children is that each spawn costs it a turn. Pair `allowed_subagents` with a `max_turns` on that agent if you want a hard ceiling on its fan-out.
+Nested children bypass the foreground/background pools but each occupies an aggregate `maxConcurrentTotal` slot (default 16), including while cancellation drains. Nested admission at aggregate capacity is refused explicitly to avoid a parent waiting behind its own slot. Cancelling or timing out a parent immediately requests cancellation recursively, without waiting for intermediate parents to settle.
 
 Because a subagent session never activates this extension (that is what keeps a child from building a second agent manager, and it is why nested tools are injected directly instead), a subagent also gets none of the extension's other surfaces: no `/agents` command, no cross-extension RPC handlers, no `subagents:ready` event.
 
@@ -484,6 +485,7 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `timeout_seconds` | number | no | Positive finite wall-clock seconds, at most 86400; default 1200 (`defaultAgentTimeoutSeconds`). Covers queue/setup/run. Not compatible with `schedule` |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline, until [`ctrl+b`](#sending-a-foreground-agent-to-the-background) hands it to the background |
 | `resume` | string | no | Agent ID to resume a previous session. The resumed run gets a fresh `max_turns` budget |
 | `isolated` | boolean | no | No extension/MCP tools |
@@ -500,7 +502,8 @@ Run a deterministic script that orchestrates many subagents. Returns a task id i
 | `scriptPath` | string | no | Path to a script file. Takes precedence over `script` and `name` |
 | `name` | string | no | A saved workflow — `<name>.js` in `.pi/workflows/`, `.agents/workflows/` or `<agent dir>/workflows/`, carrying an `export const meta` declaration |
 | `args` | any | no | Passed through to the script as the `args` global, verbatim |
-| `resumeFromRunId` | string | no | Replay an earlier run in this session — its unchanged leading `agent()` calls return their recorded results instead of spawning |
+| `resumeFromRunId` | string | no | Replay a settled, fully drained run in this activation; restored recovery observations are never replay targets |
+| `timeoutSeconds` | number | no | Positive finite wall-clock seconds, at most 86400; default 3600 (`defaultWorkflowTimeoutSeconds`). Includes pauses and gates |
 | `title` / `description` | string | no | Accepted and ignored, as in Claude Code — a workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`. Each invocation's script is persisted to the session directory and its path returned, so iterating means editing that file and re-running rather than resending the source. A saved workflow reports its own file instead, so the same loop works on it — project `.pi/workflows/` shadows a same-named global one. Those directories are ordinary folders that may hold other scripts, so only files carrying the `export const meta = { name, description }` declaration are listed or resolved; naming anything else reports that it is not a workflow rather than running it. The check is a regex over the source — nothing in the file is executed to make it, and even a real parse evaluates only the `meta` object literal, in an empty `node:vm` context with a 100ms bound.
@@ -525,9 +528,10 @@ return await pipeline(
 )
 ```
 
-When the full number of `agent()` calls is known upfront, add `totalAgents: 6` to `meta` to reserve six pending slots in progress consumers. This optional non-negative safe integer is a display plan, not an execution limit; omit it for dynamic workflows. Snapshots expose it separately as `plannedTotal`, without changing observed counts.
+Per-workflow concurrency defaults to `max(1, min(16, cpus - 2))`, configurable with `workflowConcurrency` (1–1024). Every child also shares the activation's aggregate `maxConcurrentTotal` cap (default 16). There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
 
-Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter. There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
+Before spawning, workflows durably save private admission records, captured source and journals under `getAgentDir()/workflow-recovery/<owner-hash>/`, keyed by canonical cwd and exact session ID. Progress and terminal results are checkpointed. On restart/reload, records restore as observations only: formerly active runs become interrupted failures, with no child spawn, wake-up, or CLI-flag rerun. All restored run IDs reject `resumeFromRunId`; reconcile external side effects and explicitly start fresh. Missing artifacts, orphan scripts/journals, unresolved transcript receipts without records, and corrupt or failed persistence block workflow admission. An empty registry is not proof nothing ran. Reconcile side effects and repair storage, or use a new session after reconciliation. The store admits at most 1000 records per owner (updates remain allowed); it never silently evicts history. Scripts, args and results may contain sensitive data despite owner-only file permissions.
+When the full number of `agent()` calls is known upfront, add `totalAgents: 6` to `meta` to reserve six pending slots in progress consumers. This optional non-negative safe integer is a display plan, not an execution limit; omit it for dynamic workflows. Snapshots expose it separately as `plannedTotal`, without changing observed counts.
 
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.
 
@@ -540,6 +544,8 @@ Check status and retrieve results from a background agent.
 | `agent_id` | string | yes | Agent ID to check |
 | `wait` | boolean | no | Wait for completion |
 | `verbose` | boolean | no | Include full conversation log |
+
+Agent initial/resume receipts and result lookups include `details.agent: { id, invocationId, status, draining }`. Status is the actual agent state; each resume gets a new invocation ID. `draining` reflects the physical execution lease, not logical completion: cancelled/timed-out work stays `true` until execution settles. Missing evidence is not proof of drain. Completion events and each notification member retain invocation/drain evidence; see [the protocol](docs/rpc.md#agent-invocation-evidence).
 
 Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
 
@@ -596,7 +602,9 @@ Skipping is immediate for a running agent and for one held at a pause; an agent 
 |------|-------------|
 | `--subagents-workflow-file=<path>` | Run a workflow script at session start |
 
-Use the `=` form. The bare `--flag value` spelling consumes the next argument, so `pi --subagents-workflow-file review.js "do the thing"` would take the prompt as the flag's value. Composes with headless mode: `pi -p --subagents-workflow-file=review.js`. With no tool call to attach to, the run renders as a session entry and its result is handed to the model as context for its next turn.
+The flag uses the same durable admission and deadlines as the tool. It does not replay on reload/resume or when that owner already has recovery history.
+
+Use the `=` form. The bare `--flag value` spelling consumes the next argument, so `pi --subagents-workflow-file review.js "do the thing"` would take the prompt as the flag's value. Composes with headless mode: `pi -p --subagents-workflow-file=review.js`. With no tool call to attach to, the run renders as a session entry and terminal delivery uses the same completion outbox as tool-started workflows.
 
 The `/agents` command opens an interactive menu:
 
@@ -637,7 +645,7 @@ A resumed agent gets a fresh budget: `max_turns` is counted from the resume prom
 
 ## Concurrency
 
-There are two independent pools.
+There are two scheduling pools beneath one aggregate limit: `maxConcurrentTotal`, default **16**, counts every executing invocation, including nested children, workflow agents, resumes and bypass-queue launches. Values are integers 1–1024. No path bypasses this limit. Slots remain charged until execution/cleanup actually drains, even after a logical timeout.
 
 **Background** (`maxConcurrent`, default 10). Excess agents are automatically queued and start as running agents complete. The widget shows queued agents as a collapsed count. Since agents run in the background by default, nearly every spawn takes a slot; the limit was raised from 4 so that ordinary parallel fan-outs don't queue.
 
@@ -645,11 +653,15 @@ There are two independent pools.
 
 The two are deliberately **not** one limit. A foreground agent blocks the parent anyway — the parent could have done that work itself without paying a slot — so charging it to the background pool would let a saturated pool starve the main session.
 
-The foreground pool does not cover `resume`: a foreground resume reopens an existing session and never reaches the spawn path, so several blocking resumes in one message can still run at once. A *background* resume does take a background slot and queues behind them like any other background agent.
-
-Nested children and a [workflow](#subagentworkflow)'s agents are outside the pool entirely. A nested child would deadlock behind a parent waiting on it; a workflow already bounds its own fan-out at `max(1, min(16, cpus - 2))`, and counting its agents twice would let one run fill the session's pool and starve everything else.
+Resumes use the corresponding pool and always consume an aggregate slot. Nested children and [workflow](#subagentworkflow) agents bypass these two pools, not the aggregate cap. A workflow additionally has its own `workflowConcurrency` limit.
 
 Sending a foreground agent to the background moves its slot: it gives up the foreground slot (so a queued blocking `Agent` call can start) and takes a background one. If the background pool is already full it runs above capacity rather than being suspended, and queued background work waits until the count drops back under the limit.
+
+### Wall-clock deadlines
+
+`defaultAgentTimeoutSeconds` defaults to **1200** and `defaultWorkflowTimeoutSeconds` to **3600**. Configure them in `subagents.json`; explicit tool overrides are `Agent.timeout_seconds` and `SubagentWorkflow.timeoutSeconds` (RPC uses `timeoutSeconds`). All must be positive finite seconds ≤86400. Omission uses the configured default; zero, infinity and disabling deadlines are not supported. Each resume gets a new deadline. Queueing, setup, execution, pauses and workflow gates count against the applicable deadline.
+
+A timeout settles logically once with structured `reason: { code: "timeout", deadlineAt }` and requests cancellation. It does **not** prove physical tools, providers, subprocesses or remote side effects have stopped. Capacity stays occupied while tracked execution drains. Every new workflow launch is blocked while a prior run drains, including unrelated fresh scripts. Actual pending Promises retain that fence across same-process reload for the same canonical cwd/session, including old-manager executions; a stuck operation can hold it indefinitely. Agent/RPC fresh launches and resumes also refuse admission while cancelled/timed-out work drains in this activation or prior work drains in an old activation. Ordinary concurrency remains unchanged without cancelled leases. Process restarts cannot prove external work stopped. Restored runs remain observations, never replay handles. Inspect and reconcile side effects before an explicit fresh run.
 
 ## Join Strategies
 
@@ -814,7 +826,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:steered` | Steering message accepted from any path (`steer_subagent`, `@handle`, the viewers, `subagents:rpc:steer`) — fires for a *queued* steer as well as a delivered one | `id`, `message` |
 | `subagents:usage` | Every assistant message any agent spends on — top-level, nested and workflow children alike, live while it runs | Always: `id`, `type`, `description`, `depth`, `usage` (that one message's spend as a pi `Usage`; never emitted for a message that spent nothing). Omitted when unknown, never `undefined`: `model` (`provider/id`) and `thinking` (the effective level) until the session has reported them; `requestedThinking`, only when the agent did not get the level it asked for; `parentAgentId`, nested agents only; `workflowId`, a workflow's agents only |
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |
-| `subagents:disposed` | End of `session_shutdown`, after every agent is stopped and every child session has shut down — no `subagents:usage` can follow it. A ledger flushing in its own `session_shutdown` may run before the agents are aborted; flush again here, **synchronously** (`writeFileSync`, not `fs.promises`): `emit` does not await listeners and pi calls `process.exit` once the shutdown handlers return, so nothing after a listener's first `await` is guaranteed to run | `{}` |
+| `subagents:disposed` | End of `session_shutdown`, after cancellation and bounded child-session disposal — not proof of physical termination; uncooperative work may still drain afterward. A ledger flushing in its own `session_shutdown` may run before the agents are aborted; flush again here, **synchronously** (`writeFileSync`, not `fs.promises`): `emit` does not await listeners and pi calls `process.exit` once the shutdown handlers return, so nothing after a listener's first `await` is guaranteed to run | `{}` |
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
 | `subagents:workflow-progress:v1` | Full current-session workflow snapshot on startup, creation, progress batches, pause/resume, terminal transitions and teardown; also responds to `subagents:workflow-progress:request:v1` | `{ version: 1, sessionId, workflows }`; detached workflow/phase/agent states and counts only — [contract](docs/rpc.md#workflow-progress-snapshots-v1) |
@@ -836,7 +848,7 @@ All RPC replies use a standardized envelope: `{ success: true, data?: T }` on su
 
 **Full reference:** [`docs/rpc.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md) — the complete spawn-option surface (including the fields that are silently stripped), every error string, the completion-notification race, the `Symbol.for("pi-subagents:manager")` registry, and what protocol version `2` does and does not promise. [`tintinweb/pi-tasks`](https://github.com/tintinweb/pi-tasks) is the reference implementation.
 
-For workflow observation (not control), listen on `subagents:workflow-progress:v1` and request the initial full snapshot with `pi.events.emit("subagents:workflow-progress:request:v1", {})`. Filter by `sessionId` and replace the list on each snapshot; teardown sends an empty list. The request listener is ready before `subagents:ready`. See the [v1 state and lifecycle contract](docs/rpc.md#workflow-progress-snapshots-v1); empty observed phases are not claimed complete.
+For workflow observation (not control), listen on `subagents:workflow-progress:v1` and request the initial full snapshot with `pi.events.emit("subagents:workflow-progress:request:v1", {})`. Filter by `sessionId` and replace the list on each snapshot; teardown sends an empty list. The request listener is ready before `subagents:ready`. See the [v1 state and lifecycle contract](docs/rpc.md#workflow-progress-snapshots-v1); empty observed phases are not claimed complete. Every workflow row carries explicit boolean `draining`; absence means an older runtime without drain evidence, not `false`.
 
 ### Discovery
 
@@ -885,7 +897,7 @@ pi.events.emit("subagents:rpc:spawn", {
 });
 ```
 
-`options` is the manager's spawn-option object, not the `Agent` tool's parameter schema — the background flag is `isBackground`, and the tool's snake_case `run_in_background` is forwarded verbatim and ignored. Every RPC spawn returns its id immediately and runs detached either way; `isBackground: true` is what makes the agent occupy one of the `maxConcurrent` slots (and queue behind them when they are full). It does not affect `subagents:created`, which is never emitted for an RPC spawn at all — the first event you see for one is `subagents:started`. Leaving it unset starts the agent immediately regardless of the limit. `maxConcurrentForeground` never applies here whatever `isBackground` says: it bounds only spawns a caller is blocking on inline, and every RPC spawn is detached. A top-level RPC spawn renders in the widget and FleetView while it runs, with the same live tool activity and turn counter an `Agent`-tool spawn gets — only an explicit `isBackground: false` is dropped by the widget's default `background` mode, the way a foreground `Agent` call is. Nested spawns stay hidden from both.
+`options` is the manager's spawn-option object, not the `Agent` tool's parameter schema — the background flag is `isBackground`, and the tool's snake_case `run_in_background` is forwarded verbatim and ignored. Every RPC spawn returns its id immediately and runs detached either way; `isBackground: true` is what makes the agent occupy one of the `maxConcurrent` slots (and queue behind them when they are full). It does not affect `subagents:created`, which is never emitted for an RPC spawn at all — the first event you see for one is `subagents:started`. Leaving it unset bypasses the background pool, but still queues behind the aggregate limit. `maxConcurrentForeground` never applies here whatever `isBackground` says: it bounds only spawns a caller is blocking on inline, and every RPC spawn is detached. A top-level RPC spawn renders in the widget and FleetView while it runs, with the same live tool activity and turn counter an `Agent`-tool spawn gets — only an explicit `isBackground: false` is dropped by the widget's default `background` mode, the way a foreground `Agent` call is. Nested spawns stay hidden from both.
 
 `options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context. Resolution is fuzzy, so a bare `"sonnet"` can land on a provider you never named: with [Model Scope](#model-scope) on, an override that resolves outside `enabledModels` is refused with an error envelope listing the allowed models, exactly as a caller-supplied `Agent({ model })` is. `null` means unset — the agent inherits, same as omitting the field.
 

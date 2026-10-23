@@ -10,6 +10,16 @@ const agent = (index: number, fields: Partial<WorkflowAgentEntry> = {}): Workflo
 });
 
 describe("workflow snapshot projection", () => {
+  it.each([undefined, false, true])("always publishes explicit draining evidence (%s)", draining => {
+    const task = createWorkflowTask({ id: "wf_drain1", script: "" });
+    task.draining = draining;
+    task.reason = { code: "timeout", deadlineAt: 123 };
+    const snapshot = workflowProgressSnapshot("s1", [task]);
+    expect(snapshot.workflows[0]).toMatchObject({ draining: draining === true, reason: task.reason });
+    task.draining = false;
+    expect(workflowProgressSnapshot("s1", [task]).workflows[0].draining).toBe(false);
+  });
+
   it("projects a planned total before scheduling without inventing agents or changing known counts", () => {
     const task = createWorkflowTask({ id: "wf_planned", script: "", meta: { name: "six", description: "d", totalAgents: 6 } });
     const snapshot = () => workflowProgressSnapshot("s", [task]).workflows[0];

@@ -159,6 +159,11 @@ const GATE_SHELL: readonly [string, string] =
 
 export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
+  const controller = new AbortController();
+  const abort = () => controller.abort(deps.signal?.reason);
+  if (deps.signal?.aborted) abort();
+  else deps.signal?.addEventListener("abort", abort, { once: true });
+  const signal = controller.signal;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
   /**
@@ -175,10 +180,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    * decided from one behaviour, whichever route the command took.
    */
   async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
+    signal.throwIfAborted();
     const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
       cwd,
       timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
-      ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+      signal,
     });
     const output = [result.stdout, result.stderr]
       .map(stream => stream.trim())
@@ -193,7 +199,13 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   }
 
   return {
+    abort: reason => controller.abort(reason),
+    dispose: () => deps.signal?.removeEventListener("abort", abort),
+    waitForDrain: async () => {
+      if (deps.workflowId !== undefined) await manager.waitForWorkflowDrain(deps.workflowId);
+    },
     async spawnAgent(request) {
+      signal.throwIfAborted();
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
@@ -333,7 +345,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
-            ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+            signal,
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
             ...(onBeforeWorktreeCleanup !== undefined ? { onBeforeWorktreeCleanup } : {}),
           },
@@ -370,7 +382,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const record = await manager.resume(id, prompt, deps.signal);
+      signal.throwIfAborted();
+      const record = await manager.resume(id, prompt, signal);
       if (record === undefined) {
         return {
           ok: false,

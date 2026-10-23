@@ -17,6 +17,7 @@ import {
   failWorkflowTask,
   formatWorkflowNotification,
   pauseWorkflowTask,
+  resolveResumeTarget,
   resumeWorkflowTask,
   updateWorkflowProgressBatch,
   type WorkflowTask,
@@ -106,6 +107,16 @@ it("counts unique children in notifications regardless of repeated progress", ()
   expect(formatWorkflowNotification(task)).toContain("7/7 agents");
   task.agentCount = 9;
   expect(formatWorkflowNotification(task)).toContain("7/9 agents");
+});
+
+it.each(["running", "paused"] as const)("rejects a %s resume target without touching its controls", status => {
+  const { task, control } = runningTask();
+  task.status = status;
+  task.journalPath = "/private/run.jsonl";
+  const result = resolveResumeTarget(task.id, new Map([[task.id, task]]));
+  expect(result).toMatchObject({ ok: false });
+  expect(result && !result.ok && result.message).toContain(status);
+  expect(control.resume).not.toHaveBeenCalled();
 });
 
 describe("settling a run", () => {

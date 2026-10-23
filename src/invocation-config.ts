@@ -54,7 +54,33 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
   return enabled ? isolationParamShape : {};
 }
 
+export const DEFAULT_AGENT_TIMEOUT_SECONDS = 1200;
+export const DEFAULT_WORKFLOW_TIMEOUT_SECONDS = 3600;
+export const MAX_TIMEOUT_SECONDS = 86400;
+
+export function validateTimeoutSeconds(value: number): number {
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMEOUT_SECONDS) {
+    throw new Error(`timeout must be positive and at most ${MAX_TIMEOUT_SECONDS} seconds`);
+  }
+  return value;
+}
+
+export function validateConcurrency(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 1024) {
+    throw new Error("concurrency must be an integer between 1 and 1024");
+  }
+  return value;
+}
+
+export const agentTimeoutParam = {
+  timeout_seconds: Type.Optional(Type.Number({
+    exclusiveMinimum: 0, maximum: MAX_TIMEOUT_SECONDS,
+    description: "Acceptance-to-terminal wall timeout in seconds, including queue and startup. Default 1200; maximum 86400. No unlimited value.",
+  })),
+};
+
 interface AgentInvocationParams {
+  timeout_seconds?: number;
   model?: string;
   thinking?: string;
   max_turns?: number;
@@ -98,6 +124,7 @@ export function resolveAgentInvocationConfig(
   params: AgentInvocationParams,
   opts?: ResolveOptions,
 ): {
+  timeoutSeconds?: number;
   modelInput?: string;
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
@@ -133,6 +160,7 @@ export function resolveAgentInvocationConfig(
     : undefined;
 
   return {
+    timeoutSeconds: params.timeout_seconds === undefined ? undefined : validateTimeoutSeconds(params.timeout_seconds),
     modelInput: agentConfig?.model ?? params.model,
     modelFromParams: agentConfig?.model == null && params.model != null,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,

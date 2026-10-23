@@ -16,7 +16,7 @@
 
 import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
-import type { WorkflowJournalEntry } from "./journal.js";
+import { type JournalIntegrity, journalIntegrity, readJournal, type WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
 import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
@@ -31,6 +31,11 @@ export interface WorkflowTask {
   type: "local_workflow";
   id: string;
   status: WorkflowRunStatus;
+  /** Restored observations are never live execution handles. */
+  recoveryDisposition?: "interrupted" | "terminal";
+  draining?: boolean;
+  reason?: WorkflowRunResult["reason"];
+  persistenceError?: string;
   script: string;
   /** Where the script can be edited and re-run from. */
   scriptPath?: string;
@@ -53,6 +58,7 @@ export interface WorkflowTask {
 
   /** Where this run records its own settled calls, for a later resume. */
   journalPath?: string;
+  journalIntegrity: JournalIntegrity;
   /** A previous run's journal, when this call asked to resume one. */
   replay?: readonly WorkflowJournalEntry[];
   /** The run id this one resumed, for the result line that says so. */
@@ -112,6 +118,7 @@ export function createWorkflowTask(init: {
     workflowName: init.meta?.name,
     toolCallId: init.toolCallId,
     journalPath: init.journalPath,
+    journalIntegrity: journalIntegrity(),
     replay: init.replay,
     resumedFrom: init.resumedFrom,
     replayedCount: 0,
@@ -209,6 +216,7 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
   task.replayedCount = result.replayedCount;
   task.value = result.value;
   task.error = result.error;
+  task.reason = result.reason;
   task.endTime = Date.now();
   task.onChange?.();
 }
@@ -219,6 +227,7 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
  */
 export function failWorkflowTask(task: WorkflowTask, error: string): void {
   task.control = undefined;
+  if (task.pausedAt !== undefined) task.totalPausedMs += Math.max(0, Date.now() - task.pausedAt);
   task.pausedAt = undefined;
   task.status = "failed";
   task.error = error;
@@ -248,7 +257,7 @@ export function resolveResumeTarget(
   tasks: ReadonlyMap<string, WorkflowTask>,
 ):
   | undefined
-  | { ok: true; runId: string; journalPath: string; scriptPath: string }
+  | { ok: true; runId: string; journalPath: string; scriptPath: string; replay: WorkflowJournalEntry[] }
   | { ok: false; message: string } {
   const id = runId?.trim();
   if (id === undefined || id === "") return undefined;
@@ -259,23 +268,35 @@ export function resolveResumeTarget(
     return {
       ok: false,
       message:
-        `No workflow run "${id}" in this session. ` +
-        (known.length > 0
-          ? `Runs this session: ${known.join(", ")}.`
-          : "Nothing has run yet — call this without `resumeFromRunId`."),
+        `No workflow run "${id}" in this session. Unknown history may be missing or interrupted. Reconcile side effects before considering new work in a new session. ` +
+        (known.length > 0 ? `Known runs this session: ${known.join(", ")}.` : "An empty registry is not evidence that nothing ran."),
     };
   }
-  if (prior.status === "running") {
+  if (prior.recoveryDisposition !== undefined) {
+    return { ok: false, message: `Workflow "${id}" is a recovery observation, not a replay handle. Reconcile side effects and explicitly start a fresh run without resumeFromRunId.` };
+  }
+  if (prior.draining) {
+    return { ok: false, message: `Workflow "${id}" is still draining child executions or host operations. Wait for them to drain before replaying.` };
+  }
+  if (prior.status === "running" || prior.status === "paused") {
     return {
       ok: false,
-      message: `Workflow "${id}" is still running. Stop it from /agents → Workflows before resuming it.`,
+      message: `Workflow "${id}" is still ${prior.status}. Stop it from /agents → Workflows before resuming it.`,
     };
   }
   if (prior.journalPath === undefined) {
     return { ok: false, message: `Workflow "${id}" has no journal to resume from.` };
   }
+  let replay: WorkflowJournalEntry[];
+  try {
+    if (!prior.journalIntegrity) throw new Error("Missing acknowledged journal integrity metadata.");
+    replay = readJournal(prior.journalPath, { strict: true, acknowledged: prior.journalIntegrity });
+  } catch (error) {
+    return { ok: false, message: String(error) };
+  }
   return {
     ok: true,
+    replay,
     runId: id,
     journalPath: prior.journalPath,
     // The persisted copy, which is what `scriptPath` holds when the call had
@@ -298,6 +319,8 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     task.toolCallId ? `<tool-use-id>${escapeXml(task.toolCallId)}</tool-use-id>` : null,
     task.scriptPath ? `<script>${escapeXml(task.scriptPath)}</script>` : null,
     `<status>${escapeXml(status)}</status>`,
+    task.reason ? `<reason>${escapeXml(JSON.stringify(task.reason))}</reason>` : null,
+    task.draining ? `<draining>true</draining>` : null,
     `<summary>Workflow "${escapeXml(task.workflowName ?? task.id)}" ${task.status} — ${totals.done}/${totals.total} agents${
       task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
     }</summary>`,
