@@ -167,13 +167,22 @@ function validProgress(value: unknown): boolean {
     && (value.lastAttemptReason === undefined || (typeof value.lastAttemptReason === "string" && ["throttled", "user-retry", "stalled"].includes(value.lastAttemptReason)));
 }
 
-export function assertWorkflowHistory(entries: readonly unknown[], tasks: ReadonlyMap<string, WorkflowTask>): void {
+export const WORKFLOW_RECONCILIATION_TYPE = "subagents-workflow-reconciliation-v1";
+
+export function missingWorkflowHistory(entries: readonly unknown[], tasks: ReadonlyMap<string, WorkflowTask>, owner?: WorkflowRecoveryOwner): string[] {
   const unresolved = new Set<string>();
   for (const entry of entries) {
     if (!object(entry)) continue;
     if (entry.type === "message" && object(entry.message) && entry.message.role === "toolResult" && entry.message.toolName === "SubagentWorkflow") {
       const details = entry.message.details;
       if (object(details) && typeof details.taskId === "string") unresolved.add(details.taskId);
+    }
+    if (owner && entry.type === "custom" && entry.customType === WORKFLOW_RECONCILIATION_TYPE && object(entry.data)) {
+      const data = entry.data;
+      if (data.version === 1 && data.sessionId === owner.sessionId && data.cwd === owner.cwd
+        && typeof data.taskId === "string" && RUN_ID.test(data.taskId)
+        && typeof data.note === "string" && data.note.trim() !== "" && integer(data.at)
+        && data.disposition === "unknown-acknowledged") unresolved.delete(data.taskId);
     }
     if (entry.type === "custom_message" && entry.customType === "subagent-notification" && object(entry.details)) {
       for (const notice of [entry.details, ...(Array.isArray(entry.details.others) ? entry.details.others : [])]) {
@@ -182,8 +191,12 @@ export function assertWorkflowHistory(entries: readonly unknown[], tasks: Readon
       }
     }
   }
-  const missing = [...unresolved].filter(id => !tasks.has(id));
-  requireState(missing.length === 0, `missing records for unresolved workflow receipts: ${missing.join(", ")}`);
+  return [...unresolved].filter(id => !tasks.has(id));
+}
+
+export function assertWorkflowHistory(entries: readonly unknown[], tasks: ReadonlyMap<string, WorkflowTask>, owner?: WorkflowRecoveryOwner): void {
+  const missing = missingWorkflowHistory(entries, tasks, owner);
+  if (missing.length > 0) throw new WorkflowRecoveryError(`Workflow admission blocked: missing records for unresolved workflow receipts: ${missing.join(", ")}. Reconcile side effects, then use workflow_reconcile or /workflow-reconcile with user confirmation. Missing history is not proof nothing ran.`);
 }
 
 /** Pass getAgentDir() explicitly; construction and restore never start or wake work. */

@@ -18,6 +18,7 @@ vi.mock("../src/worktree.js", async original => ({ ...await original<typeof work
 
 let env: Hermetic;
 let boots: BootedPi[];
+let contexts: Map<BootedPi, ReturnType<typeof ctx>>;
 const script = 'export const meta = { name: "recovery", description: "offline" }; return await agent("effect");';
 const meta = { name: "recovery", description: "offline" };
 const id = "wf_123456abcdef";
@@ -26,15 +27,19 @@ async function boot(flags = {}, branch: unknown[] = []) {
   const value = makePi(flags);
   boots.push(value);
   extension(value.pi);
-  await value.lifecycle.get("session_start")({}, ctx({ signal: new AbortController().signal, sessionManager: { getSessionId: () => "s1", getBranch: () => branch } }));
+  const context = ctx({ signal: new AbortController().signal, sessionManager: { getSessionId: () => "s1", getBranch: () => branch } });
+  contexts.set(value, context);
+  value.pi.appendEntry.mockImplementation((customType: string, data: unknown) => branch.push({ type: "custom", customType, data }));
+  await value.lifecycle.get("session_start")({}, context);
   return value;
 }
-const launch = (value: BootedPi, params = { script }) => value.tools.get("SubagentWorkflow").execute("wf", params, undefined, undefined, ctx());
+const launch = (value: BootedPi, params = { script }) => value.tools.get("SubagentWorkflow").execute("wf", params, undefined, undefined, contexts.get(value));
 const snapshot = (value: BootedPi) => value.pi.events.emit.mock.calls.filter((c: unknown[]) => c[0] === "subagents:workflow-progress:v1").at(-1)?.[1];
 
 beforeEach(() => {
   env = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true, defaultJoinMode: "group", outputTranscript: false } });
   boots = [];
+  contexts = new Map();
   vi.clearAllMocks();
   vi.mocked(runner.runAgent).mockImplementation(() => new Promise(() => {}));
 });
@@ -69,6 +74,149 @@ describe("offline extension recovery lifecycle", () => {
       await flush();
       expect(runtime.runWorkflow).toHaveBeenCalledTimes(1);
     });
+  });
+
+  const reconciliationType = "subagents-workflow-reconciliation-v1";
+  const reconciliationEvent = "subagents:workflow-reconciled:v1";
+  const note = "Checked external effects; outcome remains unknown.";
+  function interactive(value: BootedPi, confirmed = true) {
+    const context = contexts.get(value)!;
+    context.hasUI = true;
+    context.ui.confirm = vi.fn().mockResolvedValue(confirmed);
+    context.ui.input = vi.fn().mockResolvedValue(note);
+    return context;
+  }
+  const reconcile = (value: BootedPi, taskId = id, reconciliationNote = note) =>
+    value.tools.get("workflow_reconcile").execute("ack", { taskId, note: reconciliationNote }, undefined, undefined, contexts.get(value));
+
+  it.each(["tool", "command"])("confirmed %s reconciliation admits fresh work in the same activation, never old replay", async surface => {
+    const branch = [receipt(id)];
+    const value = await boot({}, branch);
+    const context = interactive(value);
+    const run = vi.spyOn(runtime, "runWorkflow").mockResolvedValue({ status: "completed", meta, progress: [], agentCount: 0, replayedCount: 0 });
+    expect(textOf(await launch(value))).toMatch(/blocked.*missing/i);
+    if (surface === "tool") {
+      const result = await reconcile(value);
+      expect(result.details).toEqual({ taskId: id, disposition: "unknown-acknowledged" });
+      expect(result.structuredContent).toEqual(result.details);
+      expect(textOf(result)).toMatch(/unknown-acknowledged/);
+    } else {
+      await value.commands.get("workflow-reconcile").handler(id, context);
+      expect(context.ui.input).toHaveBeenCalledTimes(1);
+    }
+    expect(context.ui.confirm).toHaveBeenCalledTimes(1);
+    expect(value.pi.appendEntry).toHaveBeenCalledWith(reconciliationType, {
+      version: 1, sessionId: "s1", cwd: process.cwd(), taskId: id, note, at: expect.any(Number), disposition: "unknown-acknowledged",
+    });
+    expect(value.pi.events.emit.mock.calls.slice(-2)).toEqual([
+      [reconciliationEvent, { version: 1, sessionId: "s1", id }],
+      ["subagents:workflow-progress:v1", expect.objectContaining({ workflows: [] })],
+    ]);
+    expect(store().restore()).toEqual([]);
+    expect(run).not.toHaveBeenCalled();
+    expect(runner.runAgent).not.toHaveBeenCalled();
+    expect(value.pi.sendMessage).not.toHaveBeenCalled();
+    expect(textOf(await launch(value, { resumeFromRunId: id } as never))).toMatch(/unknown history/i);
+    expect((await launch(value)).details.taskId).toMatch(/^wf_/);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["decline", "headless", "unknown", "blank-note", "session", "cwd", "corrupt", "persistence"])("denies %s reconciliation without append or launch", async reason => {
+    const value = await boot({}, [receipt(id)]);
+    const context = interactive(value, reason !== "decline");
+    if (reason === "headless") context.hasUI = false;
+    if (reason === "session") context.sessionManager.getSessionId = () => "foreign";
+    if (reason === "cwd") context.cwd = getAgentDir();
+    if (reason === "corrupt") {
+      store().save(createWorkflowTask({ id: "wf_other123", script, meta }));
+      writeFileSync(store().paths("wf_other123").recordPath, "{");
+    }
+    if (reason === "persistence") vi.spyOn(WorkflowRecoveryStore.prototype, "restore").mockImplementation(() => { throw new Error("disk unavailable"); });
+    const result = await reconcile(value, reason === "unknown" ? "wf_unknown123" : id, reason === "blank-note" ? " " : note);
+    expect(result.details.disposition).toBe("denied");
+    expect(value.pi.appendEntry).not.toHaveBeenCalled();
+    expect(value.pi.events.emit.mock.calls.some((c: unknown[]) => c[0] === reconciliationEvent)).toBe(false);
+    expect(runner.runAgent).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "during"])('denies cancellation %s confirmation without recording acknowledgment', async when => {
+    const value = await boot({}, [receipt(id)]);
+    const context = interactive(value);
+    const controller = new AbortController();
+    if (when === "before") controller.abort();
+    else context.ui.confirm = vi.fn(async () => { controller.abort(); return true; });
+    const result = await value.tools.get("workflow_reconcile").execute("ack", { taskId: id, note }, controller.signal, undefined, context);
+    expect(result.details.disposition).toBe("denied");
+    expect(value.pi.appendEntry).not.toHaveBeenCalled();
+    expect(textOf(await launch(value))).toMatch(/blocked.*missing/i);
+  });
+
+  it("keeps acknowledgments branch-ordered, owner-scoped and durable across reload, without clearing another ID", async () => {
+    const other = "wf_other123";
+    const branch: unknown[] = [receipt(id), receipt(other)];
+    const first = await boot({}, branch);
+    interactive(first);
+    await reconcile(first);
+    expect(textOf(await launch(first))).toContain(other);
+    await first.lifecycle.get("session_shutdown")();
+    const second = await boot({}, branch);
+    interactive(second);
+    expect((await reconcile(second)).details.disposition).toBe("denied");
+    expect(textOf(await launch(second))).toContain(other);
+    await reconcile(second, other);
+    vi.spyOn(runtime, "runWorkflow").mockResolvedValue({ status: "completed", meta, progress: [], agentCount: 0, replayedCount: 0 });
+    expect((await launch(second)).details.taskId).toMatch(/^wf_/);
+    await flush();
+    branch.push(receipt(id));
+    expect(textOf(await launch(second))).toMatch(/blocked.*missing/i);
+  });
+
+  it.each(["sessionId", "cwd", "version", "note", "at", "disposition", "type", "before"])("ignores invalid or misplaced acknowledgment: %s", async invalid => {
+    const data = { version: 1, sessionId: "s1", cwd: process.cwd(), taskId: id, note, at: Date.now(), disposition: "unknown-acknowledged" };
+    const ack = { type: "custom", customType: reconciliationType, data };
+    if (invalid === "type") ack.type = "custom_message";
+    else if (invalid !== "before") Object.assign(data, { [invalid]: invalid === "at" ? -1 : invalid === "note" ? " " : "wrong" });
+    const value = await boot({}, invalid === "before" ? [ack, receipt(id)] : [receipt(id), ack]);
+    expect(textOf(await launch(value))).toMatch(/blocked.*missing/i);
+  });
+
+  it.each(["active", "draining", "old-activation"])("denies reconciliation with %s work and does not cancel unrelated work for missing history", async state => {
+    let finish!: (result: runtime.WorkflowRunResult) => void;
+    let release!: () => void;
+    const drained = new Promise<void>(resolve => { release = resolve; });
+    const run = vi.spyOn(runtime, "runWorkflow").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const branch: unknown[] = [];
+    let value = await boot({}, branch);
+    await launch(value);
+    branch.push(receipt(id));
+    expect(textOf(await launch(value))).toMatch(/blocked.*missing/i);
+    expect(run.mock.calls[0][0].signal?.aborted).toBe(false);
+    if (state !== "active") {
+      finish({ status: "failed", meta, drained, progress: [], agentCount: 0, replayedCount: 0 });
+      await flush();
+    }
+    if (state === "old-activation") {
+      await value.lifecycle.get("session_shutdown")();
+      value = await boot({}, branch);
+    }
+    interactive(value);
+    try {
+      expect((await reconcile(value)).details.disposition).toBe("denied");
+      expect(value.pi.appendEntry).not.toHaveBeenCalled();
+    } finally {
+      if (state === "active") finish({ status: "failed", meta, progress: [], agentCount: 0, replayedCount: 0 });
+      release();
+      await flush();
+    }
+  });
+
+  it("latches append failure, emits no reconciliation and never admits work from an in-memory-only acknowledgment", async () => {
+    const value = await boot({}, [receipt(id)]);
+    interactive(value);
+    value.pi.appendEntry.mockImplementation(() => { throw new Error("append unavailable"); });
+    expect((await reconcile(value)).details.disposition).toBe("denied");
+    expect(textOf(await launch(value))).toMatch(/blocked.*append unavailable/i);
+    expect(value.pi.events.emit.mock.calls.some((c: unknown[]) => c[0] === reconciliationEvent)).toBe(false);
   });
 
   it("a nonterminal notice does not resolve missing history", async () => {

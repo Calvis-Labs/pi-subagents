@@ -530,10 +530,16 @@ return await pipeline(
 
 Per-workflow concurrency defaults to `max(1, min(16, cpus - 2))`, configurable with `workflowConcurrency` (1–1024). Every child also shares the activation's aggregate `maxConcurrentTotal` cap (default 16). There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
 
-Before spawning, workflows durably save private admission records, captured source and journals under `getAgentDir()/workflow-recovery/<owner-hash>/`, keyed by canonical cwd and exact session ID. Progress and terminal results are checkpointed. On restart/reload, records restore as observations only: formerly active runs become interrupted failures, with no child spawn, wake-up, or CLI-flag rerun. All restored run IDs reject `resumeFromRunId`; reconcile external side effects and explicitly start fresh. Missing artifacts, orphan scripts/journals, unresolved transcript receipts without records, and corrupt or failed persistence block workflow admission. An empty registry is not proof nothing ran. Reconcile side effects and repair storage, or use a new session after reconciliation. The store admits at most 1000 records per owner (updates remain allowed); it never silently evicts history. Scripts, args and results may contain sensitive data despite owner-only file permissions.
+Before spawning, workflows durably save private admission records, captured source and journals under `getAgentDir()/workflow-recovery/<owner-hash>/`, keyed by canonical cwd and exact session ID. Progress and terminal results are checkpointed. On restart/reload, records restore as observations only: formerly active runs become interrupted failures, with no child spawn, wake-up, or CLI-flag rerun. All restored run IDs reject `resumeFromRunId`; reconcile external side effects and explicitly start fresh. Missing artifacts, orphan scripts/journals, unresolved transcript receipts without records, and corrupt or failed persistence block workflow admission. An empty registry is not proof nothing ran. Missing transcript history is checked dynamically, without cancelling unrelated live tasks or latching a storage failure. After reconciling side effects, use `workflow_reconcile` or `/workflow-reconcile <taskId>` to acknowledge a missing receipt in the same session. Actual corrupt/failed storage still requires repair; acknowledgment cannot bypass it. The store admits at most 1000 records per owner (updates remain allowed); it never silently evicts history. Scripts, args and results may contain sensitive data despite owner-only file permissions.
 When the full number of `agent()` calls is known upfront, add `totalAgents: 6` to `meta` to reserve six pending slots in progress consumers. This optional non-negative safe integer is a display plan, not an execution limit; omit it for dynamic workflows. Snapshots expose it separately as `plannedTotal`, without changing observed counts.
 
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.
+
+### `workflow_reconcile`
+
+Explicitly acknowledge one unresolved workflow receipt whose record is missing. Requires `taskId` and a non-empty `note` describing checked side effects and remaining uncertainty, followed by mandatory UI confirmation. Headless calls, unknown/nonmissing IDs, active/queued/draining work (including pending prior-activation work), owner mismatch, and corrupt/failed storage are refused without an acknowledgment append.
+
+Returns readable text plus matching `details` and `structuredContent`: `{ taskId, disposition: "unknown-acknowledged" | "denied" }`. It never claims completion, creates a recovery record/result, resumes or launches work. Acknowledgments follow the current branch, exact session and canonical cwd; a later same-ID receipt invalidates the earlier acknowledgment. See [durable entry and event schema](docs/workflows.md#missing-history-reconciliation).
 
 ### `get_subagent_result`
 
@@ -563,6 +569,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 |---------|-------------|
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/workflow-reconcile <taskId>` | Acknowledge missing workflow history after entering a note and confirming in the UI; never resumes the run |
 | `/workflows` | Inspect this session's workflow runs in the TUI — opens a single run directly, or a newest-first picker for multiple runs |
 
 `/workflows` and `/agents → Workflows` open the same vertical inspector over a run, with two levels of depth. With no runs, `/workflows` reports that the session has no workflows; it does not list or launch saved scripts. Outside the TUI it explains that the inspector requires interactive mode and points to `SubagentWorkflow` and its completion notification. When [workflows](#persistent-settings) are off, the menu entry is hidden and `/workflows` points to the setting instead.
@@ -830,6 +837,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
 | `subagents:workflow-progress:v1` | Full current-session workflow snapshot on startup, creation, progress batches, pause/resume, terminal transitions and teardown; also responds to `subagents:workflow-progress:request:v1` | `{ version: 1, sessionId, workflows }`; detached workflow/phase/agent states and counts only — [contract](docs/rpc.md#workflow-progress-snapshots-v1) |
+| `subagents:workflow-reconciled:v1` | After a confirmed reconciliation entry is appended, followed by a fresh workflow-progress snapshot; not a completion or stop event | `{ version: 1, sessionId, id }` — the missing workflow remains unknown |
 | `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `{}` (empty object) |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
