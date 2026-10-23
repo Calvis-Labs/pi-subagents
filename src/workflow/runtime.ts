@@ -15,6 +15,7 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import { DEFAULT_WORKFLOW_TIMEOUT_SECONDS, validateConcurrency, validateTimeoutSeconds } from "../invocation-config.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -182,6 +183,9 @@ export type WorkflowScriptSource =
   | { ok: false; message: string };
 
 export interface WorkflowHost {
+  abort?(reason?: unknown): void;
+  dispose?(): void;
+  waitForDrain?(): Promise<void>;
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
   /** Called for every in-flight agent when the run aborts. */
   abortAgent(agentId: string): void;
@@ -269,6 +273,8 @@ export interface WorkflowControl {
 }
 
 export interface RunWorkflowOptions {
+  timeoutSeconds?: number;
+  deadlineAt?: number;
   /** Full script source, starting with `export const meta = { … }`. */
   script: string;
   args?: unknown;
@@ -312,6 +318,9 @@ export interface RunWorkflowOptions {
 
 export interface WorkflowRunResult {
   status: "completed" | "failed" | "killed";
+  reason?: { code: "timeout"; deadlineAt: number };
+  /** Physical host work may outlive the logical terminal result. */
+  drained?: Promise<void>;
   meta: WorkflowMeta;
   /** The script's return value, JSON-checked at the boundary. */
   value?: unknown;
@@ -584,13 +593,19 @@ export function validateScript(script: string): { meta: WorkflowMeta; body: stri
 
 export async function runWorkflow(options: RunWorkflowOptions): Promise<WorkflowRunResult> {
   const { script, host } = options;
+  const timeoutSeconds = validateTimeoutSeconds(options.timeoutSeconds ?? DEFAULT_WORKFLOW_TIMEOUT_SECONDS);
+  const acceptedAt = Date.now();
+  const deadlineAt = options.deadlineAt ?? acceptedAt + timeoutSeconds * 1000;
+  if (!Number.isFinite(deadlineAt) || deadlineAt > acceptedAt + 86400_000) {
+    throw new WorkflowRuntimeError("Invalid workflow timeout deadline");
+  }
 
   assertBoundarySafe(options.args, "args");
 
   const { meta, body } = validateScript(script);
   const agentCap = options.agentCap ?? WORKFLOW_AGENT_CAP;
   const itemCap = options.itemCap ?? WORKFLOW_ITEM_CAP;
-  const semaphore = new Semaphore(options.concurrency ?? workflowConcurrency());
+  const semaphore = new Semaphore(validateConcurrency(options.concurrency ?? workflowConcurrency()));
 
   const progress: WorkflowEntry[] = [];
   const inflight = new Set<string>();
@@ -613,7 +628,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   /* --- resume state ---------------------------------------------------- */
 
   const journalEntries = options.journal?.entries ?? [];
-  const recordJournal = options.journal?.append;
+  const append = options.journal?.append;
   /**
    * Whether the replayable prefix is still intact.
    *
@@ -728,10 +743,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   });
 
   return await new Promise<WorkflowRunResult>(resolve => {
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const operations = new Set<Promise<void>>();
     const emit = (entries: WorkflowEntry[]) => {
-      if (entries.length === 0) return;
+      if (settled || entries.length === 0) return;
       progress.push(...entries);
-      options.onProgress?.(entries);
+      try { options.onProgress?.(entries); } catch (error) {
+        finish({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+      }
     };
 
     const respond = (callId: number, ok: boolean, value?: unknown, error?: string, fatal?: boolean) => {
@@ -747,20 +766,43 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount" | "replayedCount">) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadlineTimer);
+      try { host.abort?.(result.reason); } catch { /* termination must still run */ }
       options.signal?.removeEventListener("abort", onAbort);
       // Symmetric with `semaphore.drain()` below: everything parked is woken so
       // it observes the settle and unwinds. Nothing depends on it — the run's
       // promise resolves either way — it just does not leave live-agent
       // bookkeeping behind for a run that is over.
       releasePause();
-      for (const agentId of inflight) host.abortAgent(agentId);
+      for (const agentId of inflight) {
+        try { host.abortAgent(agentId); } catch { /* terminate even if a host refuses abort */ }
+      }
       inflight.clear();
       semaphore.drain();
       // Resolve only once the thread is actually down, so a caller that awaits
       // runWorkflow() is guaranteed not to be leaking one.
-      const settle = () => resolve({ ...result, meta, progress, agentCount, replayedCount });
-      void worker.terminate().then(settle, settle);
+      const terminated = worker.terminate().then(() => {}, () => {});
+      const drained = terminated.then(async () => {
+        await Promise.allSettled([...operations]);
+        await host.waitForDrain?.();
+      });
+      void terminated.then(() => resolve({ ...result, meta, progress, agentCount, replayedCount, drained }));
     };
+
+    function recordJournal(entry: WorkflowJournalEntry): void {
+      if (settled) return;
+      try { append?.(entry); } catch (error) {
+        finish({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
+    }
+
+    function track(operation: Promise<void>): void {
+      const pending = operation.catch(error => {
+        finish({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+      }).finally(() => operations.delete(pending));
+      operations.add(pending);
+    }
 
     function onAbort() {
       aborted = true;
@@ -768,6 +810,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       // is spinning or wedged mid-await, which an in-process vm cannot do.
       finish({ status: "killed", error: "Workflow aborted." });
     }
+
+    deadlineTimer = setTimeout(() => {
+      aborted = true;
+      finish({ status: "failed", error: `Workflow timed out after ${timeoutSeconds} seconds.`, reason: { code: "timeout", deadlineAt } });
+    }, Math.max(0, deadlineAt - Date.now()));
+    deadlineTimer.unref();
 
     if (options.signal) {
       if (options.signal.aborted) {
@@ -948,6 +996,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           // Held before the slot, not after: a paused run must not sit on
           // concurrency it is not using while its running agents drain.
           await pauseGate(live);
+          if (settled) return;
           if (intent() === "skip") return settleSkipped({});
 
           // A resumed agent waits its turn like any other: it is the same amount of
@@ -1034,6 +1083,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
                     onResolved,
                   });
+            if (settled) return;
             if (result.ok) {
               // Recorded before the gate runs: the child itself finished, so it is
               // resumable even when its gate rejects the work — "here is what the
@@ -1175,14 +1225,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           break;
         case "call":
           if (message.method === "workflow") {
-            void handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef);
+            track(handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef));
             break;
           }
           if (message.method !== "agent") {
             respond(message.callId, false, undefined, `Unknown workflow host method "${message.method}".`, true);
             break;
           }
-          void handleAgent(message.callId, message.payload as AgentCallPayload);
+          track(handleAgent(message.callId, message.payload as AgentCallPayload));
           break;
         case "complete": {
           // The script is done, so every launch it made should have been

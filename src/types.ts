@@ -160,8 +160,18 @@ export type MentionResolution =
 /** Which concurrency pool a run is charged to. */
 export type Pool = "background" | "foreground";
 
+export interface AgentEvidence {
+  id: string;
+  invocationId: string;
+  status: AgentRecord["status"];
+  draining: boolean;
+}
+
 export interface AgentRecord {
   id: string;
+  invocationId?: string;
+  /** Physical execution lease, independent of logical status/completedAt. */
+  draining?: boolean;
   type: SubagentType;
   /**
    * Typeable name for the `@handle message` prompt mention, derived from the
@@ -328,6 +338,9 @@ export interface AgentInvocation {
 
 /** Details attached to custom notification messages for visual rendering. */
 export interface NotificationDetails {
+  agent?: AgentEvidence;
+  invocationId?: string;
+  draining?: boolean;
   id: string;
   description: string;
   status: string;

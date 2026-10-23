@@ -94,7 +94,7 @@ describe("workflow progress EventBus snapshots", () => {
     await launch();
     const task = created[0];
     expect(latest()).toEqual({ version: 1, sessionId: "s1", workflows: [{
-      id: task.id, name: "audit", status: "running", startTime: task.startTime,
+      id: task.id, name: "audit", status: "running", startTime: task.startTime, draining: false,
       phases: [{ title: "Scan", state: "not-started", done: 0, total: 0 }, { title: "Unseen", state: "not-started", done: 0, total: 0 }],
       agents: [], done: 0, total: 0,
     }] });
@@ -145,7 +145,7 @@ describe("workflow progress EventBus snapshots", () => {
     expect(latest().workflows).toEqual([]);
     expect(created[2].abortController.signal.aborted).toBe(true);
     const count = snapshots().length;
-    await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2" } }));
+    await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2", getBranch: () => [] } }));
     runs[2].options.onProgress?.([{ type: "workflow_log", message: "late" }]);
     runs[2].resolve({ status: "completed", meta, progress: [], agentCount: 0, replayedCount: 0 });
     await flush();
@@ -157,7 +157,7 @@ describe("workflow progress EventBus snapshots", () => {
     await start();
     await launch();
     const count = snapshots().length;
-    await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2" } }));
+    await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2", getBranch: () => [] } }));
     expect(snapshots().slice(count)).toEqual([
       { version: 1, sessionId: "s1", workflows: [] },
       { version: 1, sessionId: "s2", workflows: [] },
@@ -177,7 +177,7 @@ describe("workflow progress EventBus snapshots", () => {
       if (latest().workflows.length === 0) boot.lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "stop" } });
     });
     if (boundary === "shutdown") await boot.lifecycle.get("session_shutdown")({}, context);
-    context = ctx({ sessionManager: { getSessionId: () => "s2" } });
+    context = ctx({ sessionManager: { getSessionId: () => "s2", getBranch: () => [] } });
     await boot.lifecycle.get("session_start")({}, context);
     runs[1].resolve({ status: "completed", meta, progress: [], agentCount: 0, replayedCount: 0, value: "pending secret" });
     await flush();
@@ -197,10 +197,11 @@ describe("workflow progress EventBus snapshots", () => {
     boot.pi.getFlag.mockReturnValue(path);
     await start();
     if (boundary === "shutdown") await boot.lifecycle.get("session_shutdown")({}, context);
-    if (boundary !== "current") await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2" } }));
+    if (boundary !== "current") await boot.lifecycle.get("session_start")({}, ctx({ sessionManager: { getSessionId: () => "s2", getBranch: () => [] } }));
     runs[0].resolve({ status: "completed", meta, progress: [], agentCount: 0, replayedCount: 0, value: "CLI result" });
     await flush();
     expect(boot.pi.appendEntry).toHaveBeenCalledTimes(boundary === "current" ? 1 : 0);
+    await boot.lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "stop" } });
     expect(boot.pi.sendMessage).toHaveBeenCalledTimes(boundary === "current" ? 1 : 0);
   });
 

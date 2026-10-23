@@ -348,6 +348,7 @@ describe("AgentManager — nested runtime propagation", () => {
   });
 
   it("gives a workflow's child no handle, so nothing can address it", () => {
+    manager = new AgentManager();
     // Same reasoning as a nested child: it is filtered out of every top-level
     // surface, so a handle would name something unreachable and consume a name
     // a visible agent could have taken.
@@ -2405,7 +2406,7 @@ describe("AgentManager — background resume", () => {
     // Occupy the only slot with a run we can release on demand.
     let releaseBlocker!: (v: any) => void;
     vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => { releaseBlocker = resolve; }));
-    manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+    const blocker = manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
       description: "blocker",
       isBackground: true,
     });
@@ -2418,7 +2419,7 @@ describe("AgentManager — background resume", () => {
     expect(onStarted).not.toHaveBeenCalled();
 
     releaseBlocker({ responseText: "blocker done", session: mockSession(), aborted: false, steered: false });
-    await manager.getRecord(record!.id)!.promise?.catch(() => {});
+    await manager.getRecord(blocker)!.promise;
     await new Promise((r) => setTimeout(r, 0));
 
     expect(manager.getRecord(id)!.status).toBe("running");

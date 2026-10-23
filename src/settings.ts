@@ -9,6 +9,10 @@ import { NO_FALLBACK } from "./agent-types.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
+  defaultAgentTimeoutSeconds?: number;
+  defaultWorkflowTimeoutSeconds?: number;
+  maxConcurrentTotal?: number;
+  workflowConcurrency?: number;
   maxConcurrent?: number;
   /**
    * Max concurrent FOREGROUND (blocking) agents — `0` = unlimited, the default,
@@ -343,6 +347,10 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
+  setDefaultAgentTimeoutSeconds?: (n: number) => void;
+  setDefaultWorkflowTimeoutSeconds?: (n: number) => void;
+  setMaxConcurrentTotal?: (n: number) => void;
+  setWorkflowConcurrency?: (n: number) => void;
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
@@ -412,6 +420,14 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
+  for (const key of ["defaultAgentTimeoutSeconds", "defaultWorkflowTimeoutSeconds"] as const) {
+    const value = r[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 86400) out[key] = value;
+  }
+  for (const key of ["maxConcurrentTotal", "workflowConcurrency"] as const) {
+    const value = r[key];
+    if (typeof value === "number" && Number.isInteger(value) && value > 0 && value <= MAX_CONCURRENT_CEILING) out[key] = value;
+  }
   if (
     Number.isInteger(r.maxConcurrent) &&
     (r.maxConcurrent as number) >= 1 &&
@@ -571,6 +587,10 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
 
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
+  if (s.defaultAgentTimeoutSeconds !== undefined) appliers.setDefaultAgentTimeoutSeconds?.(s.defaultAgentTimeoutSeconds);
+  if (s.defaultWorkflowTimeoutSeconds !== undefined) appliers.setDefaultWorkflowTimeoutSeconds?.(s.defaultWorkflowTimeoutSeconds);
+  if (s.maxConcurrentTotal !== undefined) appliers.setMaxConcurrentTotal?.(s.maxConcurrentTotal);
+  if (s.workflowConcurrency !== undefined) appliers.setWorkflowConcurrency?.(s.workflowConcurrency);
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
   if (typeof s.maxConcurrentForeground === "number") {
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);

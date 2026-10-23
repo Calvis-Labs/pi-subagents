@@ -18,12 +18,12 @@
  * a scripted `SubagentWorkflow` call a real model has no reason to emit.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxText, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
 import { runPrintMode, toolCallsNamed, toolResultsNamed } from "../helpers/print-mode-runner.js";
 
@@ -48,17 +48,18 @@ const workflowCall = (script: string, id = "wf-call-1") =>
 
 /**
  * Every workflow journal written for `cwd`, across whatever session id the run
- * ended up with. The path is derived the same way `sessionTaskDir` derives it.
+ * ended up with. Recovery records own the paths and canonical cwd identity.
  */
 function journalsFor(cwd: string): string[] {
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+  const root = join(getAgentDir(), "workflow-recovery");
   if (!existsSync(root)) return [];
   const found: string[] = [];
-  for (const session of readdirSync(root)) {
-    const tasks = join(root, session, "tasks");
-    if (!existsSync(tasks)) continue;
+  for (const owner of readdirSync(root)) {
+    const tasks = join(root, owner);
     for (const file of readdirSync(tasks)) {
-      if (file.endsWith(".workflow.jsonl")) found.push(join(tasks, file));
+      if (!file.endsWith(".json")) continue;
+      const record = JSON.parse(readFileSync(join(tasks, file), "utf8"));
+      if (record.owner.cwd === realpathSync(cwd)) found.push(record.journalPath);
     }
   }
   return found;

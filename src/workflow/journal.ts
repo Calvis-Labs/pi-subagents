@@ -41,11 +41,30 @@
  * differently loses cache hits, it never returns another agent's answer.
  *
  * The file is JSON Lines, appended as each agent settles, so a run that is
- * killed mid-flight still leaves everything it had finished.
+ * killed mid-flight still leaves everything it had finished. The behavior above
+ * describes the same-activation cache. Durable callers opt into strict reads and
+ * throwing, fsynced writes; recovery must never turn missing history into work.
  */
 
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync } from "node:fs";
+
+const MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
+const MAX_JOURNAL_ENTRIES = 1000;
+export class WorkflowJournalError extends Error {}
+
+export interface JournalIntegrity { count: number; bytes: number; hash: string }
+
+export function journalIntegrity(raw = "", count = 0): JournalIntegrity {
+  return { count, bytes: Buffer.byteLength(raw), hash: createHash("sha256").update(raw).digest("hex") };
+}
+
+function verifyIntegrity(raw: string, count: number, expected: JournalIntegrity): void {
+  const actual = journalIntegrity(raw, count);
+  if (actual.count !== expected.count || actual.bytes !== expected.bytes || actual.hash !== expected.hash) {
+    throw new WorkflowJournalError("Acknowledged journal integrity mismatch; reconcile side effects before new work.");
+  }
+}
 
 /** One settled agent call, as replayed. */
 export interface WorkflowJournalEntry {
@@ -113,11 +132,37 @@ export function journalKey(input: JournalKeyInput): string {
 /**
  * Read a journal file into position order.
  *
- * Never throws: a missing, truncated or hand-mangled journal means "nothing to
+ * Best-effort by default: a missing, truncated or hand-mangled journal means "nothing to
  * replay", which costs tokens. Refusing to run would cost the whole run.
  * A partial last line is normal — the file is appended to while agents settle.
  */
-export function readJournal(path: string): WorkflowJournalEntry[] {
+export function readJournal(path: string, options: { strict?: boolean; acknowledged?: JournalIntegrity } = {}): WorkflowJournalEntry[] {
+  if (options.strict) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > MAX_JOURNAL_BYTES || (stat.mode & 0o077) !== 0 || stat.nlink !== 1) throw new WorkflowJournalError("Invalid journal file or size limit exceeded.");
+      const raw = readFileSync(fd, "utf8");
+      const entries: WorkflowJournalEntry[] = raw.split("\n").filter(line => line.trim() !== "").map(line => {
+        const value: unknown = JSON.parse(line);
+        if (!isEntry(value)) throw new WorkflowJournalError("Malformed journal entry.");
+        return value;
+      });
+      if (options.acknowledged) verifyIntegrity(raw, entries.length, options.acknowledged);
+      entries.sort((a, b) => a.index - b.index);
+      if (entries.length > MAX_JOURNAL_ENTRIES || entries.some((entry, index) =>
+        entry.index >= MAX_JOURNAL_ENTRIES || !/^[a-f0-9]{32}$/.test(entry.key)
+        || (index > 0 && entries[index - 1].index === entry.index))) {
+        throw new WorkflowJournalError("Invalid journal positions or entry limit exceeded.");
+      }
+      return entries;
+    } catch (error) {
+      throw new WorkflowJournalError(`Cannot replay journal ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");
@@ -141,8 +186,33 @@ export function readJournal(path: string): WorkflowJournalEntry[] {
   return entries;
 }
 
-/** Append one settled call. Failure to write is not failure to run. */
-export function appendJournal(path: string, entry: WorkflowJournalEntry): void {
+/** Append one settled call. Durable callers require a private, fsynced write or an explicit error. */
+export function appendJournal(path: string, entry: WorkflowJournalEntry, options: { durable?: boolean; acknowledged?: JournalIntegrity } = {}): void {
+  if (options.durable) {
+    let fd: number | undefined;
+    try {
+      if (!isEntry(entry) || !/^[a-f0-9]{32}$/.test(entry.key) || entry.index >= MAX_JOURNAL_ENTRIES) {
+        throw new WorkflowJournalError("Invalid durable journal entry.");
+      }
+      const line = `${JSON.stringify(entry)}\n`;
+      if (Buffer.byteLength(line) > MAX_JOURNAL_BYTES) throw new WorkflowJournalError("Journal size limit exceeded.");
+      fd = openSync(path, constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW);
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size + Buffer.byteLength(line) > MAX_JOURNAL_BYTES || (stat.mode & 0o077) !== 0 || stat.nlink !== 1) {
+        throw new WorkflowJournalError("Invalid private journal file or size limit exceeded.");
+      }
+      const raw = options.acknowledged ? readFileSync(fd, "utf8") : "";
+      if (options.acknowledged) verifyIntegrity(raw, raw.split("\n").filter(line => line.trim() !== "").length, options.acknowledged);
+      appendFileSync(fd, line, "utf8");
+      fsyncSync(fd);
+      if (options.acknowledged) Object.assign(options.acknowledged, journalIntegrity(raw + line, options.acknowledged.count + 1));
+    } catch (error) {
+      throw new WorkflowJournalError(`Cannot persist journal ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+    return;
+  }
   try {
     appendFileSync(path, `${JSON.stringify(entry)}\n`, "utf-8");
   } catch {

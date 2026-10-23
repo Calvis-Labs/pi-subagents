@@ -36,7 +36,7 @@ The tool returns immediately. The run continues in the background and notifies y
 ```text
 Workflow "auth-audit" started in the background.
 Task ID: wf_9f3ab21c04de
-Script: /var/folders/xy/…/pi-subagents-501/Users-me-project/<session>/tasks/wf_9f3ab21c04de.workflow.js
+Script: <agent dir>/workflow-recovery/<owner-hash>/wf_9f3ab21c04de.workflow.js
 
 You will be notified when it finishes — do NOT poll or sleep waiting for it.
 To iterate, edit the script file and call SubagentWorkflow again with scriptPath.
@@ -46,7 +46,7 @@ Three things in there matter.
 
 **`Task ID`** is what `resumeFromRunId` takes, and what `/agents → Workflows` lists the run under.
 
-**`Script`** is the file to edit. **It is a scratch file in your system temp directory, not in your project** — it will not survive a reboot or a temp sweep. If the workflow turns out to be worth keeping, copy it somewhere durable; see [Save it](#5-save-it). The path means something slightly different depending on how the run was started: for an inline script it is a copy the tool just wrote, and for a run started from `scriptPath` or `name` it is *your own file*, reported straight back.
+**`Script`** is the file to edit. Inline scripts live in private durable recovery storage under the configured agent directory. To share or name one, see [Save it](#5-save-it). The captured source in the admission record remains authoritative for recovery observations, even if the editable file changes. The path means something slightly different depending on how the run was started: for an inline script it is a copy the tool just wrote, and for a run started from `scriptPath` or `name` it is *your own file*, reported straight back.
 
 **The last line is addressed to the model, not to you.** You do not call `SubagentWorkflow` yourself — you tell the model to re-run the workflow at that path.
 
@@ -95,7 +95,7 @@ Because it changes nothing, `c` works at both levels and on an agent that has al
 
 A run's own agents are not listed separately in the fleet list, the widget, the `/agents` menus or `@handle` resolution — they belong to the run, which reports for them. `c` in the inspector is the one way in to a child's conversation.
 
-Other extensions can observe the same session's workflow progress through the supported in-process `subagents:workflow-progress:v1` snapshot channel. Subscribe, then emit `subagents:workflow-progress:request:v1` with `{}` for the initial state. Snapshots include workflow status, phase/child states and counts, not prompts or results. An empty phase that has been invoked is `observed`, not complete; declared unseen phases remain `not-started`. This adds no rendering or control surface. See the [full protocol contract](rpc.md#workflow-progress-snapshots-v1).
+Other extensions can observe the same session's workflow progress through the supported in-process `subagents:workflow-progress:v1` snapshot channel. Subscribe, then emit `subagents:workflow-progress:request:v1` with `{}` for the initial state. Snapshots include workflow status, phase/child states and counts, plus an explicit boolean `draining` on every workflow row, not prompts or results. Missing `draining` is not drain evidence; `false` on a restored observation does not prove external effects stopped. An empty phase that has been invoked is `observed`, not complete; declared unseen phases remain `not-started`. This adds no rendering or control surface. See the [full protocol contract](rpc.md#workflow-progress-snapshots-v1).
 
 ### 4. Edit and re-run
 
@@ -105,12 +105,14 @@ Re-running normally re-pays for every agent. `resumeFromRunId` avoids that:
 
 > Its unchanged leading `agent()` calls return their recorded results instantly; the first changed or failed call, and everything after it, runs live.
 
-Every run journals each settled `agent()` call beside its script as `<run id>.workflow.jsonl`, and the resume replays the **unchanged prefix** of that journal. It is a prefix and not a lookup table on purpose: a later call that still matches came from a run whose earlier stages no longer exist, so its recorded answer was produced downstream of work that has changed.
+Live tasks retain the acknowledged journal's entry count, byte length and SHA-256 hash. A durable append updates that metadata and checkpoints it before acknowledging the call. Requested replay, subsequent checkpoints and restore verify the metadata against the journal; valid JSON prefixes, empty truncations and same-length edits are rejected rather than becoming live execution. An empty journal is valid only with zero acknowledged entries. A crash between journal fsync and checkpoint replacement fails closed on restore.
+
+Every run journals each settled `agent()` call in its private recovery directory as `<run id>.workflow.jsonl`, and the resume replays the **unchanged prefix** of that journal. It is a prefix and not a lookup table on purpose: a later call that still matches came from a run whose earlier stages no longer exist, so its recorded answer was produced downstream of work that has changed.
 
 Four things it will not do:
 
-- **Cross sessions.** The journal is keyed to the session that wrote it. Restart pi and the run id is dead — you get `No workflow run "<id>" in this session.`
-- **Resume a live run.** Stop it from `/agents → Workflows` first; while it is running you get `Workflow "<id>" is still running.`
+- **Cross activations or sessions.** Restart/reload restores observations only under the exact session ID and canonical cwd. Every restored run, terminal or interrupted, rejects replay: reconcile side effects and explicitly start fresh without `resumeFromRunId`.
+- **Resume a live or draining run.** Stop it from `/agents → Workflows` first, then wait for owned child executions and host operations to drain. Any draining run blocks every new workflow launch, including unrelated fresh scripts. Logical settlement is not evidence of physical stop.
 - **Replay a failure.** A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. That is the point.
 - **Replay a run that used `agent({ resume })` at all.** A replayed agent is text from a file rather than a live child, so there would be no conversation left for a later `resume` to continue.
 
@@ -118,7 +120,7 @@ Replayed rows are annotated `from resume journal` on the card and in the inspect
 
 ### 5. Save it
 
-A script you will run more than once belongs somewhere durable. Copy it out of the temp directory into one of these, named `<name>.js`:
+A script you will run more than once belongs in a named library. Copy it from private recovery storage into one of these, named `<name>.js`:
 
 | Location | Scope |
 |---|---|
@@ -227,7 +229,8 @@ export const meta = {
 | `scriptPath` | string | A script file, absolute or project-relative. **Takes precedence over `script`** — this is how an edited workflow is re-run |
 | `name` | string | A saved workflow — `<name>.js` in one of the three directories above. Lowest precedence |
 | `args` | any | Handed to the script as the `args` global, verbatim. Must be JSON-shaped |
-| `resumeFromRunId` | string | Replay an earlier run in this session. Matches `^wf_[a-z0-9-]{6,}$` |
+| `resumeFromRunId` | string | Replay a settled, fully drained run in this activation; never a restored observation. Matches `^wf_[a-z0-9-]{6,}$` |
+| `timeoutSeconds` | number | Positive finite seconds ≤86400; defaults to `defaultWorkflowTimeoutSeconds` (3600) |
 | `title` / `description` | string | Accepted and ignored — for Claude Code parity, so a ported call does not fail. A workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
@@ -286,11 +289,13 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 
 | What | Where |
 |---|---|
-| An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
-| The resume journal | the same directory, `<run id>.workflow.jsonl` |
+| Captured script and private admission record | `<getAgentDir()>/workflow-recovery/<owner-hash>/<run id>.workflow.js` and `<run id>.json` |
+| The result journal | the same directory, `<run id>.workflow.jsonl` |
 | Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/` → installed pi packages, first hit wins |
 
-The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only the third is durable, and copying a script there is a manual step.
+Recovery storage is durable and private (directories 0700, files 0600), namespaced by canonical cwd plus exact session ID. It captures source, hash, args, progress and terminal results; it does not serialize a worker stack or child session. Admission and empty journal creation precede spawning. Strict journal/checkpoint failure stops further admission. Malformed, foreign-owner, oversize or unsafe files block restore/admission rather than silently rerunning work. Existing records, scripts and journals are never silently recreated after loss; durable append requires an already admitted journal. Orphan owned scripts/journals without records also block admission. Each owner admits at most 1000 records, with updates still allowed at the cap. Records may contain sensitive source and outputs; permissions are not encryption.
+
+Startup restores observations without spawning agents, sending completion notifications or waking the parent. Prior running/paused records become interrupted failures. All restored records reject `resumeFromRunId`, including previously completed ones. Reconcile any external effects, then explicitly start a fresh workflow. Existing requested script paths are preserved for editing, but captured record source is authoritative for observations. There is no automatic continuation or arbitrary-stack recovery. Startup compares unresolved `SubagentWorkflow` tool receipts on the current session branch with the restored store; missing current or legacy records block fresh admission even when the registry is empty. Terminal historical notifications (including batched `others`) resolve their receipts and do not by themselves block unrelated work. Unknown run IDs mean unknown or interrupted history, never proof nothing ran. Missing history requires user-side reconciliation and store repair, or a new session after reconciliation; there is no automatic migration or reconciliation command.
 
 A pi package can ship workflow scripts too, by declaring them in its `package.json`:
 
@@ -304,7 +309,10 @@ Package directories are searched **last**, so a script of yours always wins the 
 
 | Limit | Value |
 |---|---|
-| Agents running at once | `max(1, min(16, cpus - 2))` — 6 on an 8-core machine |
+| Per-workflow concurrency | `workflowConcurrency`: 1–1024; default `max(1, min(16, cpus - 2))` |
+| Aggregate executing agents across all paths | `maxConcurrentTotal`: 1–1024; default 16; includes nested children and resumes |
+| Agent wall deadline | 1200 seconds (`defaultAgentTimeoutSeconds`); explicit `Agent.timeout_seconds` or RPC `timeoutSeconds`, positive finite ≤86400 |
+| Workflow wall deadline | 3600 seconds (`defaultWorkflowTimeoutSeconds`); explicit tool `timeoutSeconds`, positive finite ≤86400 |
 | Agents per run, total | 1000 |
 | Items per `parallel`/`pipeline` **call** | 4096 |
 | Nested `workflow()` calls per run | 256 |
@@ -314,13 +322,13 @@ These are three different things and are easy to conflate: 1000 is a budget for 
 
 Above 25 scheduled agents, or 1.5M tokens actual or projected, the card adds `⚠ Large workflow · /agents → Workflows to stop`.
 
-A run's concurrency limit is its own, independent of the session's `maxConcurrent` and `maxConcurrentForeground` pools — its agents do not enter either.
+Workflow children bypass `maxConcurrent` and `maxConcurrentForeground`, but not the aggregate cap. Slots remain charged until physical execution/cleanup drains. Deadlines include queueing and setup; the workflow deadline also includes pauses, nested workflow loads and gates. Timeout produces one failed logical outcome with `reason: { code: "timeout", deadlineAt }`, requests recursive cancellation, and fences late writes. Cancellation cannot guarantee that providers, shell commands or remote effects physically stopped. All fresh workflow launches and replay remain blocked while host operations or owned executions drain, potentially indefinitely for uncooperative work. Same-process reload keeps actual pending Promises under the canonical cwd/session, including disposed-manager executions; it does not reset their accounting or adopt them into a replacement runtime. Restored observations remain non-replayable after drain. Agent/RPC launches and resumes also fail closed while old-activation work drains; same-activation cancelled/timed-out leases block new admission until physical drain. Normal concurrency without cancelled leases is unchanged. A process restart loses in-memory drain evidence; reconcile external effects before new work. No persisted PID is treated as proof of ownership or stop.
 
 ### Settings and the CLI flag
 
 `workflowsEnabled` is **on**; leaving it unset means *auto*, which is on unless another extension already offers a `Workflow` or `SubagentWorkflow` tool, in which case this one stands down for the session. Setting it explicitly pins it. See [Persistent settings](../README.md#persistent-settings).
 
-`pi --subagents-workflow-file=<path>` runs a workflow at startup, including headless under `pi -p`. Use the `=` form — the bare `--flag value` spelling swallows the next argument. See [CLI flags](../README.md#cli-flags).
+`pi --subagents-workflow-file=<path>` runs a workflow at startup, including headless under `pi -p`. Use the `=` form — the bare `--flag value` spelling swallows the next argument. The flag uses the same private admission/journal path and deadlines as the tool. Reload/resume and existing recovery history suppress flag execution; restore never reruns it. See [CLI flags](../README.md#cli-flags).
 
 ## Recipes
 
@@ -404,17 +412,17 @@ Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a str
 The file is not in any of the three directories, or it is there but carries no `export const meta =` declaration, so it is not recognized as a workflow. The message lists the directories it searched and any workflows it did find.
 
 **The run seems stuck with agents queued.**
-Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slots free. A pause (`p`) also holds new starts while letting running agents finish.
+Check both `workflowConcurrency` and the aggregate `maxConcurrentTotal` (default 16). Queued agents start as slots physically drain, not merely when a timeout is reported. A pause (`p`) also holds new starts, but does not extend the wall deadline.
 
 ## What workflows can't do
 
 - **No filesystem, network or module access inside the script.** All real work happens in the agents it spawns, which have their normal tools.
 - **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`.
 - **No cross-session resume.** Journals are per session.
-- **No resume at all for `--subagents-workflow-file` runs** — that path never journals.
+- **No cross-activation replay or automatic continuation.** Restored tool and CLI runs are observations only; reconcile side effects and explicitly start fresh.
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
 - **No scheduled workflows.** The scheduler runs agents, not workflows.
-- **Results are not persisted** beyond the journal and the transcript card.
+- **No proof of physical stop.** A logical terminal result may precede draining tools/providers/cleanup.
 - **Observation only from another extension.** The progress snapshot protocol above is read-only; it does not drive a workflow. A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
 
 The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.

@@ -15,6 +15,9 @@ export interface WorkflowProgressSnapshot {
     status: WorkflowRunStatus;
     startTime: number;
     endTime?: number;
+    reason?: WorkflowTask["reason"];
+    recoveryDisposition?: WorkflowTask["recoveryDisposition"];
+    draining: boolean;
     phases: { title: string; state: WorkflowPhaseState; done: number; total: number }[];
     agents: { index: number; label: string; state: WorkflowDisplayState; phaseTitle?: string }[];
     done: number;
@@ -40,6 +43,7 @@ export function workflowProgressSnapshot(sessionId: string, tasks: Iterable<Work
         task.progressVersion, task.workflowProgress.length, task.id,
         task.meta?.name ?? task.workflowName ?? task.id, task.status,
         task.startTime, task.endTime, task.agentCount, task.meta?.phases?.map(phase => phase.title),
+        task.reason, task.recoveryDisposition, task.draining,
       ]);
       const cached = projections.get(task);
       if (cached?.fingerprint === fingerprint && cached.progress === task.workflowProgress) return cached.value;
@@ -64,6 +68,9 @@ export function workflowProgressSnapshot(sessionId: string, tasks: Iterable<Work
         status: task.status,
         startTime: task.startTime,
         ...(task.endTime !== undefined ? { endTime: task.endTime } : {}),
+        ...(task.reason !== undefined ? { reason: { ...task.reason } } : {}),
+        ...(task.recoveryDisposition !== undefined ? { recoveryDisposition: task.recoveryDisposition } : {}),
+        draining: task.draining === true,
         phases,
         agents: agents.map(agent => {
           const phaseTitle = agent.phaseTitle ?? (agent.phaseIndex !== undefined ? phaseTitles.get(agent.phaseIndex) ?? groupTitles.get(agent.index) : undefined);
@@ -81,6 +88,7 @@ export function workflowProgressSnapshot(sessionId: string, tasks: Iterable<Work
       return value;
     }).map(workflow => ({
       ...workflow,
+      ...(workflow.reason ? { reason: { ...workflow.reason } } : {}),
       phases: workflow.phases.map(phase => ({ ...phase })),
       agents: workflow.agents.map(agent => ({ ...agent })),
     })),

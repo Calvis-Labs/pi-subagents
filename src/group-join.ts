@@ -63,7 +63,7 @@ export class GroupJoinManager {
     const group = this.groups.get(groupId);
     if (!group || group.delivered) return 'pass';
 
-    group.completedRecords.set(record.id, record);
+    group.completedRecords.set(record.id, { ...record, lifetimeUsage: { ...record.lifetimeUsage } });
 
     // All done — deliver immediately
     if (group.completedRecords.size >= group.agentIds.size) {

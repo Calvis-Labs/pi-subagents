@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { abortable } from "./abortable.js";
+import { agentExecutionDetails } from "./agent-evidence.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -16,7 +17,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
+import { agentTimeoutParam, isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -50,6 +51,7 @@ export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.m
 const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
 
 interface NestedSpawnOptions {
+  timeoutSeconds?: number;
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -89,7 +91,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number }): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number; timeoutSeconds?: number }): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -104,8 +106,8 @@ export interface NestedToolContext {
   configCwd: string;
 }
 
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], isError, details: {} };
+function textResult(text: string, isError = false, record?: AgentRecord) {
+  return { content: [{ type: "text" as const, text }], isError, details: agentExecutionDetails(record) };
 }
 
 function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): record is AgentRecord {
@@ -170,6 +172,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
+      ...agentTimeoutParam,
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
@@ -190,9 +193,10 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         // back to the limit the child was spawned with, then the default.
         const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
           maxTurns: getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns,
+          timeoutSeconds: params.timeout_seconds,
         });
         return resumed
-          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
+          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error", resumed)
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
       }
 
@@ -263,6 +267,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         description: params.description,
         model,
         maxTurns: invocation.maxTurns,
+        timeoutSeconds: invocation.timeoutSeconds,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
@@ -348,7 +353,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Worktree isolation starts the agent asynchronously; surface its
           // failure as a tool error, like the synchronous throw used to.
           await context.manager.awaitStartup(id);
-          return textResult(`Nested agent started in background. Agent ID: ${id}`);
+          return textResult(`Nested agent started in background. Agent ID: ${id}`, false, context.manager.getRecord(id));
         }
 
         const { record } = await context.manager.spawnAndWait(
@@ -359,7 +364,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           { ...options, signal },
           attachTranscript,
         );
-        return textResult(formatRecord(record, "inline"), record.status === "error");
+        return textResult(formatRecord(record, "inline"), record.status === "error", record);
       } catch (err) {
         return textResult(err instanceof Error ? err.message : String(err), true);
       }
@@ -389,7 +394,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      return textResult(formatRecord(record, "fetched"), record.status === "error", record);
     },
   });
 

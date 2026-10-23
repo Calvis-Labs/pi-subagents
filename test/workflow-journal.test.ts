@@ -11,7 +11,7 @@
  * prove that everything from there on is spawned for real.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -80,6 +80,54 @@ describe("journal files", () => {
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "wf-journal-")); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it("fails explicitly on durable journal IO errors without changing legacy best-effort IO", () => {
+    const path = join(dir, "missing", "run.jsonl");
+    const entry = { index: 0, key: journalKey({ prompt: "a" }), ok: true, text: "a" };
+    expect(() => appendJournal(path, entry, { durable: true })).toThrow();
+    expect(() => appendJournal(path, entry)).not.toThrow();
+    expect(() => readJournal(path, { strict: true })).toThrow();
+    expect(readJournal(path)).toEqual([]);
+  });
+
+  it("does not create or recreate a durable journal", () => {
+    const path = join(dir, "lost.jsonl");
+    const entry = { index: 0, key: journalKey({ prompt: "effect" }), ok: true };
+    expect(() => appendJournal(path, entry, { durable: true })).toThrow();
+    expect(existsSync(path)).toBe(false);
+    writeFileSync(path, "", { mode: 0o600 });
+    appendJournal(path, entry, { durable: true });
+    rmSync(path);
+    expect(() => appendJournal(path, entry, { durable: true })).toThrow();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("round-trips private durable entries in logical rather than completion order", () => {
+    const path = join(dir, "durable.jsonl");
+    writeFileSync(path, "", { mode: 0o600 });
+    const first = { index: 0, key: journalKey({ prompt: "first" }), ok: true, text: "first" };
+    const second = { index: 1, key: journalKey({ prompt: "second" }), ok: true, text: "second" };
+    appendJournal(path, second, { durable: true });
+    appendJournal(path, first, { durable: true });
+    expect(readJournal(path, { strict: true })).toEqual([first, second]);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("refuses symlinked durable journals without changing the target", () => {
+    const target = join(dir, "target.jsonl");
+    const path = join(dir, "linked.jsonl");
+    writeFileSync(target, "unchanged", { mode: 0o600 });
+    symlinkSync(target, path);
+    expect(() => readJournal(path, { strict: true })).toThrow();
+    expect(() => appendJournal(path, { index: 0, key: journalKey({ prompt: "first" }), ok: true, text: "first" }, { durable: true })).toThrow();
+    expect(readFileSync(target, "utf8")).toBe("unchanged");
+  });
+
+  it("strict reads reject torn entries rather than silently shorten the prefix", () => {
+    const path = join(dir, "torn.jsonl");
+    writeFileSync(path, '{"index":0');
+    expect(() => readJournal(path, { strict: true })).toThrow();
+  });
 
   it("round-trips appended entries in position order", () => {
     const path = join(dir, "run.jsonl");

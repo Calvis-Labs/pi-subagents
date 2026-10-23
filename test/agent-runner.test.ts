@@ -2858,8 +2858,9 @@ describe("agent-runner abort signal forwarding", () => {
     const { session } = createSession("SHOULD NOT RUN");
     createAgentSession.mockResolvedValue({ session });
 
-    await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+    await expect(runAgent(ctx, "Explore", "go", { pi, signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
 
+    expect(createAgentSession).not.toHaveBeenCalled();
     expect(session.prompt).not.toHaveBeenCalled();
   });
 

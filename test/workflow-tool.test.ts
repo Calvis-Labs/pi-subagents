@@ -138,7 +138,10 @@ describe("createWorkflowHost — spawn mapping", () => {
 
     const options = stub.spawnAndWait.mock.calls[0][4];
     expect(options.isolation).toBe("worktree");
-    expect(options.signal).toBe(controller.signal);
+    expect(options.signal.aborted).toBe(false);
+    controller.abort();
+    expect(options.signal.aborted).toBe(true);
+    host.dispose?.();
     expect(options.rootSessionId).toBe("root-1");
   });
 
@@ -539,7 +542,9 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", expect.any(AbortSignal));
+    host.abort?.();
+    expect(stub.resume.mock.calls[0][2].aborted).toBe(true);
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
   });
 
@@ -1150,7 +1155,7 @@ describe("--subagents-workflow-file", () => {
     expect(booted.pi.appendEntry).not.toHaveBeenCalledWith(WORKFLOW_ENTRY_TYPE, expect.anything());
   });
 
-  it("renders the finished run as a session entry and hands it to the model as next-turn context", async () => {
+  it("renders the finished run as a session entry and wakes the model through the outbox", async () => {
     const path = join(hermetic.dir, "flow.js");
     writeFileSync(path, `${fileScript}log("scanned");\nreturn "all clear";\n`);
     const booted = makePi({ [WORKFLOW_FILE_FLAG]: path });
@@ -1167,11 +1172,10 @@ describe("--subagents-workflow-file", () => {
     // The card is rebuilt from this log, so the entry has to carry it.
     expect(data.progress).toContainEqual({ type: "workflow_log", message: "scanned" });
 
-    // nextTurn, not followUp: a flag-launched run puts its result in context
-    // without forcing a turn the user never asked for.
-    const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => c[0]?.customType === "workflow-result");
+    await vi.waitFor(() => expect(booted.pi.sendMessage).toHaveBeenCalled());
+    const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => c[0]?.customType === "subagent-notification");
     expect(sent, "the run's outcome must reach the model").toBeTruthy();
-    expect(sent![1]).toMatchObject({ deliverAs: "nextTurn" });
+    expect(sent![1]).toMatchObject({ deliverAs: "steer", triggerTurn: true });
     expect(String(sent![0].content)).toContain("<result>all clear</result>");
   });
 
