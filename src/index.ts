@@ -74,7 +74,7 @@ import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
 import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/meta.js";
 import { elapsedMs } from "./workflow/progress.js";
-import { assertWorkflowHistory, WorkflowRecoveryStore } from "./workflow/recovery.js";
+import { assertWorkflowHistory, missingWorkflowHistory, WORKFLOW_RECONCILIATION_TYPE, WorkflowRecoveryStore } from "./workflow/recovery.js";
 import { runWorkflow, workflowConcurrency } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { WORKFLOW_PROGRESS_CHANNEL, WORKFLOW_PROGRESS_REQUEST_CHANNEL, workflowProgressSnapshot } from "./workflow/snapshot.js";
@@ -2678,25 +2678,109 @@ Terse command-style prompts produce shallow, generic work.
           }, () => { /* Unknown drain remains fenced. */ });
         }
       }
-      assertWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks);
       if (restored.length > 0) workflowFlagHandled = true;
       const failed = restored.find(task => task.persistenceError !== undefined);
       if (failed) blockWorkflowRecovery(failed.persistenceError);
     } catch (error) {
       blockWorkflowRecovery(error);
     }
-    if (recoveryBlocker) {
-      if (ctx.hasUI) ctx.ui.notify(recoveryBlocker, "warning");
-      else console.warn(`[pi-subagents] ${recoveryBlocker}`);
+    let warning = recoveryBlocker;
+    if (!warning) {
+      try { assertWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks, { cwd, sessionId }); }
+      catch (error) { warning = String(error); }
+    }
+    if (warning) {
+      if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+      else console.warn(`[pi-subagents] ${warning}`);
     }
   }
+
+  async function reconcileWorkflow(ctx: ExtensionContext, taskId: string, suppliedNote?: string, signal?: AbortSignal) {
+    const result = (disposition: "denied" | "unknown-acknowledged", text: string) => {
+      const details = { taskId, disposition };
+      return { content: [{ type: "text" as const, text }], details, structuredContent: details, isError: disposition === "denied" };
+    };
+    const store = recoveryStore;
+    const sessionId = workflowSessionId;
+    const cwd = workflowSessionCwd;
+    const check = () => {
+      signal?.throwIfAborted();
+      if (!ctx.hasUI) throw new Error("Reconciliation requires UI confirmation.");
+      if (!store || store !== recoveryStore || sessionId === undefined || cwd === undefined
+        || ctx.sessionManager.getSessionId() !== sessionId || realpathSync(ctx.cwd) !== cwd) {
+        throw new Error("Reconciliation requires the current session and canonical cwd activation.");
+      }
+      if (recoveryBlocker) throw new Error(recoveryBlocker);
+      const drain = workflowDrainBlocker();
+      if (drain) throw new Error(drain);
+      if (manager.hasRunning() || manager.listAgents().some(agent => agent.draining)
+        || [...workflowTasks.values()].some(task => task.status === "running" || task.status === "paused")
+        || (pendingExecutions.get(JSON.stringify([cwd, sessionId]))?.size ?? 0) > 0) {
+        throw new Error("Reconciliation denied while active or pending work exists.");
+      }
+      let restored: WorkflowTask[];
+      try {
+        restored = store.restore();
+        const failed = restored.find(task => task.persistenceError !== undefined);
+        if (failed) throw new Error(failed.persistenceError);
+      } catch (error) { throw new Error(blockWorkflowRecovery(error)); }
+      if (restored.some(task => task.id === taskId) || !/^wf_[a-z0-9-]{6,80}$/.test(taskId)
+        || !missingWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks, { cwd, sessionId }).includes(taskId)) {
+        throw new Error("Reconciliation requires an unresolved missing workflow receipt on the current branch.");
+      }
+    };
+    try {
+      check();
+      const branchTip = ctx.sessionManager.getBranch().at(-1);
+      const note = (suppliedNote ?? await ctx.ui.input("Reconciliation note: describe checked side effects and remaining uncertainty"))?.trim();
+      if (!note) throw new Error("A non-empty reconciliation note is required.");
+      if (!await ctx.ui.confirm("Acknowledge unknown workflow history?", `${taskId}\n${note}\n\nConfirm you have reconciled external side effects. The outcome remains unknown: this does not prove completion or physical stop, recover a result, or resume the old run.`)) {
+        throw new Error("Reconciliation declined; history is unchanged.");
+      }
+      check();
+      if (ctx.sessionManager.getBranch().at(-1) !== branchTip) throw new Error("Session branch changed during confirmation; retry reconciliation.");
+      try {
+        pi.appendEntry(WORKFLOW_RECONCILIATION_TYPE, { version: 1, sessionId, cwd, taskId, note, at: Date.now(), disposition: "unknown-acknowledged" });
+        if (missingWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks, { cwd: cwd!, sessionId: sessionId! }).includes(taskId)) {
+          throw new Error("Reconciliation append is not present on the current branch.");
+        }
+      } catch (error) { throw new Error(blockWorkflowRecovery(error)); }
+      pi.events.emit("subagents:workflow-reconciled:v1", { version: 1, sessionId, id: taskId });
+      emitWorkflowProgress();
+      return result("unknown-acknowledged", `Workflow ${taskId}: unknown-acknowledged. No result recovered and no work resumed. Fresh unrelated workflows may be admitted if no other blockers remain.`);
+    } catch (error) {
+      return result("denied", `Workflow reconciliation denied: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  pi.registerTool(defineTool({
+    name: "workflow_reconcile",
+    label: "Reconcile Workflow History",
+    description: "Acknowledge one missing workflow receipt after checking external side effects. Requires taskId, a non-empty note, and explicit UI confirmation. Never completes, resumes, replays or launches work; refuses active/draining work and corrupt or failed persistence.",
+    parameters: Type.Object({
+      taskId: Type.String({ pattern: "^wf_[a-z0-9-]{6,80}$" }),
+      note: Type.String({ minLength: 1, description: "What side effects were checked and what remains unknown." }),
+    }),
+    outputSchema: Type.Object({ taskId: Type.String(), disposition: Type.Union([Type.Literal("denied"), Type.Literal("unknown-acknowledged")]) }),
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => reconcileWorkflow(ctx, params.taskId, params.note, signal),
+  }));
+
+  pi.registerCommand("workflow-reconcile", {
+    description: "Acknowledge missing workflow history: /workflow-reconcile <taskId> (note and confirmation required)",
+    handler: async (args, ctx) => {
+      const result = await reconcileWorkflow(ctx, args.trim());
+      const text = result.content[0].text;
+      if (ctx.hasUI) ctx.ui.notify(text, result.isError ? "warning" : "info");
+      else console.warn(`[pi-subagents] ${text}`);
+    },
+  });
 
   function trackWorkflowTask(task: WorkflowTask, ctx: ExtensionContext): void {
     const store = recoveryStore;
     if (recoveryBlocker || !store) throw new Error(recoveryBlocker ?? "Workflow recovery is not initialized.");
     const drainBlocker = workflowDrainBlocker();
     if (drainBlocker) throw new Error(drainBlocker);
-    try { assertWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks); } catch (error) { throw new Error(blockWorkflowRecovery(error)); }
+    assertWorkflowHistory(ctx.sessionManager.getBranch(), workflowTasks, { cwd: workflowSessionCwd!, sessionId: workflowSessionId! });
     const paths = store.paths(task.id);
     task.journalPath = paths.journalPath;
     task.scriptPath ??= paths.scriptPath;
