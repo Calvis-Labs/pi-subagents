@@ -24,9 +24,12 @@ interface WorkflowProgressSnapshot {
     agents: { index: number; label: string; state: string; phaseTitle?: string }[];
     done: number;
     total: number;
+    plannedTotal?: number;
   }[];
 }
 ```
+
+`plannedTotal`, when supplied by the author's `meta.totalAgents`, is a non-negative safe integer available before scheduling. It is a display plan only: `total` and `done` retain their observed-count semantics. Consumers can reserve `max(plannedTotal ?? 0, total)` slots; do not invent agent records or mark unstarted slots complete on termination. Omission means the final total is unknown, and observed work can exceed a declaration.
 
 Times are Unix epoch milliseconds. Optional fields are omitted, not `undefined`. Each payload is a detached projection: mutating it cannot change the tasks or a future snapshot. Only the fields above are sent; there are no prompts, results, errors, scripts, paths, logs, model details or raw task records. Names, labels and phase titles are author-supplied display text, not a redaction guarantee for text an author puts in those fields.
 

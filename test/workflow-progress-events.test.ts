@@ -129,6 +129,15 @@ describe("workflow progress EventBus snapshots", () => {
     expect(latest().workflows[0].agents[0].label).toBe("scan");
   });
 
+  it("publishes the declared total in the initial tool snapshot before any child starts", async () => {
+    await start();
+    const plannedMeta = { ...meta, totalAgents: 6 };
+    await boot.tools.get("SubagentWorkflow").execute("tc", {
+      script: `export const meta = ${JSON.stringify(plannedMeta)}; return 1;`,
+    }, undefined, undefined, context);
+    expect(latest().workflows[0]).toMatchObject({ plannedTotal: 6, total: 0, done: 0, agents: [] });
+  });
+
   it("publishes full multi-run snapshots for failures and kills, then clears without late resurrection", async () => {
     await start();
     await launch();
