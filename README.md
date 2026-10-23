@@ -525,6 +525,8 @@ return await pipeline(
 )
 ```
 
+When the full number of `agent()` calls is known upfront, add `totalAgents: 6` to `meta` to reserve six pending slots in progress consumers. This optional non-negative safe integer is a display plan, not an execution limit; omit it for dynamic workflows. Snapshots expose it separately as `plannedTotal`, without changing observed counts.
+
 Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter. There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
 
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.

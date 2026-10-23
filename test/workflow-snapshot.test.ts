@@ -10,6 +10,24 @@ const agent = (index: number, fields: Partial<WorkflowAgentEntry> = {}): Workflo
 });
 
 describe("workflow snapshot projection", () => {
+  it("projects a planned total before scheduling without inventing agents or changing known counts", () => {
+    const task = createWorkflowTask({ id: "wf_planned", script: "", meta: { name: "six", description: "d", totalAgents: 6 } });
+    const snapshot = () => workflowProgressSnapshot("s", [task]).workflows[0];
+    expect(snapshot()).toMatchObject({ plannedTotal: 6, done: 0, total: 0, agents: [] });
+    for (let index = 0; index < 7; index++) {
+      updateWorkflowProgressBatch(task, [agent(index)]);
+      expect(snapshot()).toMatchObject({ plannedTotal: 6, done: index, total: index + 1 });
+      updateWorkflowProgressBatch(task, [agent(index, { state: "done" })]);
+    }
+    expect(snapshot()).toMatchObject({ plannedTotal: 6, done: 7, total: 7 });
+    task.meta!.totalAgents = 8;
+    expect(snapshot().plannedTotal).toBe(8);
+    task.meta!.totalAgents = 0;
+    expect(snapshot().plannedTotal).toBe(0);
+    delete task.meta!.totalAgents;
+    expect(snapshot()).not.toHaveProperty("plannedTotal");
+  });
+
   it("projects only changed tasks and returns detached cached rows", () => {
     const tasks = Array.from({ length: 50 }, (_, index) => createWorkflowTask({ id: `wf_${index}`, script: "" }));
     for (const task of tasks) updateWorkflowProgressBatch(task, [agent(0)]);

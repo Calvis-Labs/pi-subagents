@@ -36,6 +36,16 @@ describe("extractMeta — acceptance", () => {
   });
 });
 
+describe("extractMeta — planned agent total", () => {
+  it.each([0, 6, Number.MAX_SAFE_INTEGER])("preserves a declared total of %s", totalAgents => {
+    expect(extractMeta(`export const meta = { name: 'wf', description: 'd', totalAgents: ${totalAgents} }`).meta.totalAgents).toBe(totalAgents);
+  });
+
+  it.each(["-1", "1.5", "'6'", "null", "true", "NaN", "Infinity", "9007199254740992"])("rejects %s", value => {
+    expect(() => extractMeta(`export const meta = { name: 'wf', description: 'd', totalAgents: ${value} }`)).toThrow(/meta.totalAgents/);
+  });
+});
+
 describe("extractMeta — body rewriting", () => {
   it("strips the export keyword so the body compiles outside a module", () => {
     const { body } = extractMeta(`${HEADER}\nreturn 1`);

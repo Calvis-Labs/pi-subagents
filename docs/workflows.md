@@ -203,7 +203,7 @@ The finished script ships as [`examples/workflows/fan-out-audit.js`](../examples
 
 Occasionally you will want to write or heavily edit one. The rules are short.
 
-**`meta` must be a pure literal** — no variables, function calls, spreads, or template interpolation. It is read *before* the script runs, which is what lets the phases appear on screen from the first frame instead of materializing one at a time as agents happen to start. `name` and `description` are required; `phases` and `whenToUse` are optional.
+**`meta` must be a pure literal** — no variables, function calls, spreads, or template interpolation. It is read *before* the script runs, which is what lets the phases appear on screen from the first frame instead of materializing one at a time as agents happen to start. `name` and `description` are required; `phases`, `whenToUse`, and `totalAgents` are optional. Set `totalAgents: 6` for six planned `agent()` calls, including nested calls, so progress consumers can reserve six slots before the first child starts. It must be a non-negative safe integer; omit it when branches or loops determine the count at runtime. This is a display plan, not a scheduling limit or a phase count. Observed counts remain authoritative if execution exceeds the plan; an early exit does not mark unstarted slots complete.
 
 ```js
 export const meta = {

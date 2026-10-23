@@ -34,6 +34,7 @@ export interface WorkflowMeta {
   /** Shown in the saved-workflow listing. Not used by the runtime. */
   whenToUse?: string;
   phases?: WorkflowPhaseMeta[];
+  totalAgents?: number;
 }
 
 export interface MetaExtraction {
@@ -274,6 +275,9 @@ export function extractMeta(source: string): MetaExtraction {
   if (raw.whenToUse !== undefined && typeof raw.whenToUse !== "string") {
     fail("`meta.whenToUse` must be a string.");
   }
+  if (raw.totalAgents !== undefined && (typeof raw.totalAgents !== "number" || !Number.isSafeInteger(raw.totalAgents) || raw.totalAgents < 0)) {
+    fail("`meta.totalAgents` must be a non-negative safe integer.");
+  }
   const phases = assertPhases(raw.phases);
 
   const meta: WorkflowMeta = {
@@ -281,6 +285,7 @@ export function extractMeta(source: string): MetaExtraction {
     description: raw.description,
     ...(raw.whenToUse !== undefined ? { whenToUse: raw.whenToUse as string } : {}),
     ...(phases !== undefined ? { phases } : {}),
+    ...(raw.totalAgents !== undefined ? { totalAgents: raw.totalAgents as number } : {}),
   };
 
   // Strip only the `export ` keyword. Replacing it with spaces rather than
