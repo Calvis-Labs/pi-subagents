@@ -22,6 +22,7 @@ export interface WorkflowProgressSnapshot {
     agents: { index: number; label: string; state: WorkflowDisplayState; phaseTitle?: string }[];
     done: number;
     total: number;
+    plannedTotal?: number;
   }[];
 }
 
@@ -42,7 +43,7 @@ export function workflowProgressSnapshot(sessionId: string, tasks: Iterable<Work
       const fingerprint = JSON.stringify([
         task.progressVersion, task.workflowProgress.length, task.id,
         task.meta?.name ?? task.workflowName ?? task.id, task.status,
-        task.startTime, task.endTime, task.agentCount, task.meta?.phases?.map(phase => phase.title),
+        task.startTime, task.endTime, task.agentCount, task.meta?.phases?.map(phase => phase.title), task.meta?.totalAgents,
         task.reason, task.recoveryDisposition, task.draining,
       ]);
       const cached = projections.get(task);
@@ -83,6 +84,7 @@ export function workflowProgressSnapshot(sessionId: string, tasks: Iterable<Work
         }),
         done: agents.filter(agent => agent.state === "done").length,
         total: Math.max(task.agentCount, agents.length),
+        ...(task.meta?.totalAgents !== undefined ? { plannedTotal: task.meta.totalAgents } : {}),
       };
       projections.set(task, { fingerprint, progress: task.workflowProgress, value });
       return value;

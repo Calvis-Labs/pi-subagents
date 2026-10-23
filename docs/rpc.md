@@ -27,11 +27,14 @@ interface WorkflowProgressSnapshot {
     agents: { index: number; label: string; state: string; phaseTitle?: string }[];
     done: number;
     total: number;
+    plannedTotal?: number;
   }[];
 }
 ```
 
 Times are Unix epoch milliseconds. `draining` is always an explicit boolean, including `false`; its absence identifies a runtime without drain evidence and consumers must not interpret absence as drained. Optional fields are omitted, not `undefined`. Each payload is a detached projection: mutating it cannot change the tasks or a future snapshot. Only the fields above are sent; there are no prompts, results, errors, scripts, paths, logs, model details or raw task records. Names, labels and phase titles are author-supplied display text, not a redaction guarantee for text an author puts in those fields.
+`plannedTotal`, when supplied by the author's `meta.totalAgents`, is a non-negative safe integer available before scheduling. It is a display plan only: `total` and `done` retain their observed-count semantics. Consumers can reserve `max(plannedTotal ?? 0, total)` slots; do not invent agent records or mark unstarted slots complete on termination. Omission means the final total is unknown, and observed work can exceed a declaration.
+
 
 Consumers must filter by their current `sessionId` and **replace**, not merge, that session's workflow list. Workflows are in creation order; agents are in ascending index order, with last-write-wins progress collapsed before counting. Completed, failed and killed workflows stay in the list until teardown. `done` counts only successful children (including journal-replayed successes), not failed/skipped/blocked children. Workflow `total` is the maximum of scheduled count and observed child count; phase `total` is its observed child count. Neither predicts future calls or means percentage of the script completed; totals can grow and retries can change states.
 
